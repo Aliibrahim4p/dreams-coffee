@@ -1,8 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../app/generated/prisma"
@@ -10,4 +5,314 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+model Employee {
+  pos_id         Int            @id
+  first_name     String
+  last_name      String
+  shift_sessions ShiftSession[]
+
+  @@map("employee")
+}
+
+model Manager {
+  manager_id               Int                     @id @default(autoincrement())
+  /// login for both POS terminal and admin PC
+  username                 String                  @unique
+  /// hashed password for system login (NFR-009)
+  password_hash            String
+  first_name               String
+  last_name                String
+  created_at               DateTime
+  deliveries               Delivery[]
+  inventory_count_entries  InventoryCountEntry[]
+  terminal_unlock_sessions TerminalUnlockSession[]
+
+  @@map("manager")
+}
+
+model TerminalUnlockSession {
+  unlock_id     Int      @id @default(autoincrement())
+  manager_id    Int
+  /// the moment manager authenticated to unlock the terminal for the day (FR-001)
+  unlocked_at   DateTime
+  /// calendar date of the unlock; used to enforce once-per-day requirement
+  unlocked_date DateTime @db.Date
+  manager       Manager  @relation(fields: [manager_id], references: [manager_id])
+
+  @@map("terminal_unlock_session")
+}
+
+model Category {
+  category_id Int       @id @default(autoincrement())
+  name        String    @unique
+  products    Product[]
+
+  @@map("category")
+}
+
+model Product {
+  product_id       Int             @id @default(autoincrement())
+  category_id      Int
+  name             String
+  /// classification only; deduction logic is recipe-driven for all
+  type             ProductType
+  /// LBP
+  base_price       Decimal
+  order_line_items OrderLineItem[]
+  category         Category        @relation(fields: [category_id], references: [category_id])
+  recipes          Recipe[]
+
+  @@map("product")
+}
+
+model SizeModifier {
+  modifier_id      Int             @id @default(autoincrement())
+  /// Small / Medium / Large
+  name             String
+  /// LBP, added to base_price
+  price_adjustment Decimal         @default(0)
+  order_line_items OrderLineItem[]
+  recipes          Recipe[]
+
+  @@map("size_modifier")
+}
+
+model InventoryItem {
+  item_id                 Int                   @id @default(autoincrement())
+  name                    String                @unique
+  unit                    UnitOfMeasure
+  /// atomic decrement only (see notes)
+  current_stock           Decimal               @default(0)
+  /// FR-044
+  count_frequency         CountFrequency
+  /// FR-027
+  is_negative_flag        Boolean               @default(false)
+  delivery_line_items     DeliveryLineItem[]
+  inventory_count_entries InventoryCountEntry[]
+  pack_configurations     PackConfiguration[]
+  recipe_ingredients      RecipeIngredient[]
+
+  @@map("inventory_item")
+}
+
+model Supplier {
+  supplier_id Int        @id @default(autoincrement())
+  name        String
+  is_active   Boolean?
+  deliveries  Delivery[]
+
+  @@map("supplier")
+}
+
+model AppConfig {
+  /// e.g. 'manager_pin', 'exchange_rate'
+  config_key   String @id
+  /// manager_pin: hashed shared PIN for void/refund only (AUTH-GATE-01, swappable to card later per NFR-018). exchange_rate: LBP per USD (FR-013)
+  config_value String
+
+  @@map("app_config")
+}
+
+model ShiftSession {
+  session_id      String     @id @default(uuid())
+  /// which cashier is operating (FR-002)
+  cashier_pos_id  Int
+  /// LBP, > 0 (FR-002)
+  starting_float  Decimal
+  start_time      DateTime
+  /// null while open; set at cash-out — this IS the cash-out event (FR-004)
+  end_time        DateTime?
+  /// LBP
+  live_cash_total Decimal
+  sync_status     SyncStatus @default(pending)
+  /// timestamp of successful sync; null until synced (FR-035)
+  synced_at       DateTime?
+  orders          Order[]
+  cashier         Employee   @relation(fields: [cashier_pos_id], references: [pos_id])
+
+  @@map("shift_session")
+}
+
+model Recipe {
+  recipe_id   Int                @id @default(autoincrement())
+  product_id  Int
+  /// null for reseller products (no size); non-null for recipe_based products
+  modifier_id Int?
+  modifier    SizeModifier?      @relation(fields: [modifier_id], references: [modifier_id])
+  product     Product            @relation(fields: [product_id], references: [product_id])
+  ingredients RecipeIngredient[]
+
+  @@unique([product_id, modifier_id])
+  @@map("recipe")
+}
+
+model PackConfiguration {
+  config_id           Int                @id @default(autoincrement())
+  item_id             Int
+  /// e.g. 'Box of Milk', 'Pack of Milk', 'Bag of Sugar'
+  pack_name           PackType
+  /// base units yielded by one of this pack; e.g. Box of Milk = 12 (L), Bag of Sugar = 100 (sachets) (FR-025)
+  base_unit_qty       Decimal
+  delivery_line_items DeliveryLineItem[]
+  item                InventoryItem      @relation(fields: [item_id], references: [item_id])
+
+  @@unique([item_id, pack_name])
+  @@map("pack_configuration")
+}
+
+model Delivery {
+  delivery_id   String             @id @default(uuid())
+  /// manager who received the delivery (FR-044)
+  manager_id    Int
+  supplier_id   Int
+  date_received DateTime           @db.Date
+  /// optional; e.g. discrepancies, partial shipments, damaged goods
+  notes         String?
+  sync_status   SyncStatus         @default(pending)
+  /// timestamp of successful sync; null until synced (FR-035)
+  synced_at     DateTime?
+  manager       Manager            @relation(fields: [manager_id], references: [manager_id])
+  supplier      Supplier           @relation(fields: [supplier_id], references: [supplier_id])
+  line_items    DeliveryLineItem[]
+
+  @@map("delivery")
+}
+
+model DeliveryLineItem {
+  delivery_id   String
+  item_id       Int
+  /// which pack unit was received, e.g. 'Box of Sugar' vs 'Sachet' (FR-025)
+  config_id     Int
+  /// count of the selected pack unit, NOT base units; server multiplies by pack_configuration.base_unit_qty before committing to stock (FR-025)
+  qty_received  Decimal
+  /// LBP; cost per one of the selected pack unit (FR-044)
+  cost_per_unit Decimal
+  config        PackConfiguration @relation(fields: [config_id], references: [config_id])
+  delivery      Delivery          @relation(fields: [delivery_id], references: [delivery_id])
+  item          InventoryItem     @relation(fields: [item_id], references: [item_id])
+
+  @@id([delivery_id, item_id, config_id])
+  @@map("delivery_line_item")
+}
+
+model InventoryCountEntry {
+  count_id       String        @id @default(uuid())
+  item_id        Int
+  /// manager who submitted the count (FR-027)
+  manager_id     Int
+  physical_count Decimal
+  entry_date     DateTime      @db.Date
+  /// editable same-day; locked once date changes (FR-027)
+  is_locked      Boolean       @default(false)
+  sync_status    SyncStatus    @default(pending)
+  /// timestamp of successful sync; null until synced (FR-035)
+  synced_at      DateTime?
+  item           InventoryItem @relation(fields: [item_id], references: [item_id])
+  manager        Manager       @relation(fields: [manager_id], references: [manager_id])
+
+  @@unique([item_id, entry_date])
+  @@map("inventory_count_entry")
+}
+
+model Order {
+  order_id         String          @id @default(uuid())
+  session_id       String
+  transaction_type TransactionType @default(sale)
+  /// null for refunds (a refund is neither dine-in nor take-out)
+  order_type       OrderType?
+  /// FR-041
+  status           OrderStatus     @default(open)
+  /// LBP; negative for refunds
+  total_due        Decimal
+  /// LBP (USD converted on FE before storage); null while open
+  cash_tendered    Decimal?
+  /// LBP; cash_tendered - total_due, stored explicitly for receipts and cash reconciliation (FR-022)
+  change_given     Decimal?
+  /// when the basket was opened; used for crash recovery (FR-041)
+  created_at       DateTime
+  /// checkout time; null while open. Receipt timestamp (FR-019) and basis for same-day search (FR-046)
+  completed_at     DateTime?
+  sync_status      SyncStatus      @default(pending)
+  /// timestamp of successful sync; null until synced (FR-035)
+  synced_at        DateTime?
+  line_items       OrderLineItem[]
+  session          ShiftSession    @relation(fields: [session_id], references: [session_id])
+
+  @@index([session_id, status])
+  @@map("orders")
+}
+
+model RecipeIngredient {
+  recipe_id Int
+  item_id   Int
+  /// exact amount to deduct;can be negative; for resellers, always 1
+  quantity  Decimal
+  /// must match inventory_item.unit; for resellers, typically 'piece'
+  unit      UnitOfMeasure
+  item      InventoryItem @relation(fields: [item_id], references: [item_id])
+  recipe    Recipe        @relation(fields: [recipe_id], references: [recipe_id])
+
+  @@id([recipe_id, item_id])
+  @@map("recipe_ingredient")
+}
+
+model OrderLineItem {
+  line_item_id String        @id @default(uuid())
+  order_id     String
+  product_id   Int
+  /// nullable: reseller items have no size
+  modifier_id  Int?
+  quantity     Int
+  /// LBP, snapshot = base_price + price_adjustment at add-time (FR-008)
+  unit_price   Decimal
+  modifier     SizeModifier? @relation(fields: [modifier_id], references: [modifier_id])
+  order        Order         @relation(fields: [order_id], references: [order_id])
+  product      Product       @relation(fields: [product_id], references: [product_id])
+
+  @@map("order_line_item")
+}
+
+enum ProductType {
+  recipe_based
+  reseller
+}
+
+enum UnitOfMeasure {
+  g
+  ml
+  piece
+}
+
+enum CountFrequency {
+  daily
+  monthly
+}
+
+enum OrderType {
+  dine_in
+  take_out
+}
+
+enum TransactionType {
+  sale
+  refund
+}
+
+enum OrderStatus {
+  open
+  completed
+}
+
+enum SyncStatus {
+  pending
+  synced
+  failed
+}
+
+enum PackType {
+  box
+  bag_or_sleeve
+  default_unit
 }
