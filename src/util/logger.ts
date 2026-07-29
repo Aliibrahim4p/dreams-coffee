@@ -1,4 +1,4 @@
-import config from "@/config";
+import config from "@/src/config";
 import winston from "winston";
 
 const { logDir, isDev } = config;
