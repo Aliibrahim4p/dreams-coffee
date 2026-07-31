@@ -12,7 +12,7 @@ model Employee {
   first_name     String
   last_name      String
   shift_sessions ShiftSession[]
-
+  is_active      Boolean        @default(true)
   @@map("employee")
 }
 
@@ -28,7 +28,7 @@ model Manager {
   deliveries               Delivery[]
   inventory_count_entries  InventoryCountEntry[]
   terminal_unlock_sessions TerminalUnlockSession[]
-
+  is_active                Boolean                 @default(true)
   @@map("manager")
 }
 
@@ -48,7 +48,7 @@ model Category {
   category_id Int       @id @default(autoincrement())
   name        String    @unique
   products    Product[]
-
+  is_active   Boolean   @default(true)
   @@map("category")
 }
 
@@ -63,6 +63,7 @@ model Product {
   order_line_items OrderLineItem[]
   category         Category        @relation(fields: [category_id], references: [category_id])
   recipes          Recipe[]
+  is_active        Boolean         @default(true)
 
   @@map("product")
 }
@@ -75,7 +76,7 @@ model SizeModifier {
   price_adjustment Decimal         @default(0)
   order_line_items OrderLineItem[]
   recipes          Recipe[]
-
+  is_active        Boolean         @default(true)
   @@map("size_modifier")
 }
 
@@ -93,7 +94,7 @@ model InventoryItem {
   inventory_count_entries InventoryCountEntry[]
   pack_configurations     PackConfiguration[]
   recipe_ingredients      RecipeIngredient[]
-
+  is_active               Boolean               @default(true)
   @@map("inventory_item")
 }
 
