@@ -1,18 +1,24 @@
 import { ProductRepository } from "@/repository/product-repository";
 import { ProductCreate, ProductUpdate } from "@/types/product";
 import { RecipeCreate, RecipeUpdate } from "@/types/recipe";
+import logger from "@/util/logger";
 
 export class ProductService {
   static async createProduct(data: ProductCreate) {
-    return new ProductRepository().createProduct(data);
+    const product = await new ProductRepository().createProduct(data);
+    logger.info("Product created: %s (id=%d)", product.name, product.product_id);
+    return product;
   }
 
   static async updateProduct(productId: number, data: ProductUpdate) {
-    return new ProductRepository().updateProduct(productId, data);
+    const product = await new ProductRepository().updateProduct(productId, data);
+    logger.info("Product updated: id=%d", productId);
+    return product;
   }
 
   static async deactivateProduct(productId: number): Promise<void> {
-    return new ProductRepository().deactivateProduct(productId);
+    await new ProductRepository().deactivateProduct(productId);
+    logger.info("Product deactivated: id=%d", productId);
   }
 
   static async listCategoryProducts(categoryId: number, includeInactive?: boolean) {
@@ -28,10 +34,14 @@ export class ProductService {
   }
 
   static async createRecipe(productId: number, data: RecipeCreate) {
-    return new ProductRepository().createRecipe(productId, data);
+    const recipe = await new ProductRepository().createRecipe(productId, data);
+    logger.info("Recipe created: product_id=%d modifier_id=%s", productId, data.modifier_id);
+    return recipe;
   }
 
   static async updateRecipe(productId: number, recipeId: number, data: RecipeUpdate) {
-    return new ProductRepository().updateRecipe(productId, recipeId, data);
+    const recipe = await new ProductRepository().updateRecipe(productId, recipeId, data);
+    logger.info("Recipe updated: product_id=%d recipe_id=%d", productId, recipeId);
+    return recipe;
   }
 }

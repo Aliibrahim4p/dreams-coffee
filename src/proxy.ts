@@ -6,6 +6,7 @@ import { verifyPanelSecret } from "@/lib/panel-secret";
 import { verifySessionToken } from "@/lib/session-jwt";
 import { ManagerRepository } from "@/repository/manager-repository";
 import { ShiftSessionRepository } from "@/repository/shift-session-repository";
+import logger from "@/util/logger";
 
 const MANAGER_TOKEN_HEADER = "x-manager-token";
 const MANAGER_ID_HEADER = "x-manager-id";
@@ -96,7 +97,8 @@ function matchesSessionAndPanelRoute(method: string, pathname: string): boolean 
   return SESSION_AND_PANEL_ROUTES.some((route) => route.method === method && route.pattern.test(pathname));
 }
 
-function unauthorized(message: string) {
+function unauthorized(method: string, pathname: string, message: string) {
+  logger.warn("401 %s %s: %s", method, pathname, message);
   return NextResponse.json({ error: message }, { status: 401 });
 }
 
@@ -124,10 +126,12 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const method = request.method;
 
+  logger.info("%s %s", method, pathname);
+
   if (matchesAdminRoute(method, pathname)) {
     const adminToken = request.headers.get(ADMIN_TOKEN_HEADER);
     if (!adminToken || !verifyAdminToken(adminToken)) {
-      return unauthorized("Admin authentication required");
+      return unauthorized(method, pathname, "Admin authentication required");
     }
     return NextResponse.next();
   }
@@ -135,11 +139,11 @@ export async function proxy(request: NextRequest) {
   if (matchesSessionAndPanelRoute(method, pathname)) {
     const sessionId = await resolveSessionId(request);
     if (!sessionId) {
-      return unauthorized("Active session required");
+      return unauthorized(method, pathname, "Active session required");
     }
     const panelToken = request.headers.get(PANEL_TOKEN_HEADER);
     if (!panelToken || !verifyPanelSecret(panelToken)) {
-      return unauthorized("Panel access required");
+      return unauthorized(method, pathname, "Panel access required");
     }
     return forwardSessionId(request, sessionId);
   }
@@ -147,7 +151,7 @@ export async function proxy(request: NextRequest) {
   if (matchesPanelRoute(method, pathname)) {
     const panelToken = request.headers.get(PANEL_TOKEN_HEADER);
     if (!panelToken || !verifyPanelSecret(panelToken)) {
-      return unauthorized("Panel access required");
+      return unauthorized(method, pathname, "Panel access required");
     }
     return NextResponse.next();
   }
@@ -158,17 +162,17 @@ export async function proxy(request: NextRequest) {
 
   const token = request.headers.get(MANAGER_TOKEN_HEADER);
   if (!token) {
-    return unauthorized("Manager authentication required");
+    return unauthorized(method, pathname, "Manager authentication required");
   }
 
   const payload = verifyManagerToken(token);
   if (!payload) {
-    return unauthorized("Invalid or expired manager token");
+    return unauthorized(method, pathname, "Invalid or expired manager token");
   }
 
   const isActive = await new ManagerRepository().isActiveManager(payload.manager_id);
   if (!isActive) {
-    return unauthorized("Invalid or expired manager token");
+    return unauthorized(method, pathname, "Invalid or expired manager token");
   }
 
   const forwardedHeaders = new Headers(request.headers);
