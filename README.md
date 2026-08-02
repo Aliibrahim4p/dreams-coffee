@@ -37,15 +37,22 @@ incrementally, and deliberate deviations are called out in code comments and in
 - **Offline sync**: connectivity heartbeat, batch order sync from the PWA's local
   IndexedDB store
 
+## Order building lives on the frontend
+
+Opening a basket, adding/editing/voiding line items, clearing it, and checkout all
+happen client-side in the terminal PWA's local IndexedDB — not as backend endpoints.
+The backend only ever sees an order once it's already resolved: `POST
+/sync/records` accepts orders the frontend has completed (sales and refunds alike) and
+persists them. There's no server-side "build the order" flow to call into, and no
+void/refund/clear endpoints — those are frontend basket operations that either never
+reach the server at all, or arrive pre-resolved as a finished sync record. See
+`Api Contract.yaml`'s `Orders`/`Receipts`/`Refunds` tag descriptions for the original
+target design this superseded.
+
 ## Not yet implemented
 
-See the `Orders`/`Receipts`/`Refunds`/`Reports` tag descriptions in `Api Contract.yaml`
-for the full target design:
-
-- The live `/orders` resource — open a basket, add/edit/void line items, clear,
-  checkout (atomic stock deduction), receipt, refund. Today, an order only ever reaches
-  the server pre-completed via the offline sync endpoint.
-- `/reports/daily-sales` — live daily totals.
+- `/reports/daily-sales` — live daily totals, described in `Api Contract.yaml` but no
+  route exists yet.
 
 ## Architecture
 
@@ -56,7 +63,7 @@ for the full target design:
 |---|---|---|
 | `X-Manager-Token` | `POST /api/auth/manager/login` (username + password) | Admin-PC surface: inventory, deliveries, config, catalog writes |
 | `X-Admin-Token` | `POST /api/auth/admin/login` (shared `ADMIN_SECRET_KEY`) | Manager provisioning, recipe authoring — never combined with a manager token |
-| `X-Panel-Token` | `POST /api/auth/manager/pin/verify` (shared PIN) | Manager Panel on the terminal: open a shift, cash out, (eventually) void/refund/clear. A static, non-expiring shared secret — the PIN check itself is the security boundary |
+| `X-Panel-Token` | `POST /api/auth/manager/pin/verify` (shared PIN) | Manager Panel on the terminal: open a shift, cash out. A static, non-expiring shared secret — the PIN check itself is the security boundary |
 | `X-Session-Token` | `POST /api/shift-sessions` (issued on shift open) | "Is there an open, un-cashed-out shift on this terminal" — the whole check for a sale. Not a personal credential |
 
 PIN verification is deliberately **public** (no prior token required): it's the only way
@@ -68,7 +75,7 @@ behind every deviation from `Api Contract.yaml`.
 **Offline-first orders:** the terminal PWA builds and completes baskets entirely
 client-side in local IndexedDB (including crash recovery of an in-progress basket) and
 pushes finished orders to `POST /api/sync/records` once connectivity allows — see
-**Not yet implemented** above for what a live checkout flow would add on top of this.
+**Order building lives on the frontend** above.
 
 ## Getting started
 
@@ -110,7 +117,6 @@ Api Contract.yaml    OpenAPI spec — target behavior for the full system
 
 ## Next steps
 
-- Build the live `/orders` resource and `/reports/daily-sales`, per **Not yet
-  implemented** above.
+- Build `/reports/daily-sales`, per **Not yet implemented** above.
 - **Analytics** — for both the backend (sales/inventory/session reporting endpoints) and
   the frontend (terminal- and admin-facing dashboards consuming them).
