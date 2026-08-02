@@ -50,6 +50,12 @@ info:
         V1, with no authenticated actor in this contract. A proper admin
         surface is a V1.1 addition.
       - FR-017 USD→LBP conversion, client-side per NFR-001.
+      - FR-041 crash recovery ("what's my session, what's my open basket").
+        Handled entirely client-side from state persisted in the PWA's local
+        IndexedDB — the same store that holds orders before they're synced.
+        There is no `GET /shift-sessions/current` (or equivalent) endpoint;
+        the device already knows its own session_token and open basket
+        without asking the server.
 servers:
   - url: /api/v1
 tags:
@@ -58,9 +64,26 @@ tags:
   - name: Shift Sessions
   - name: Catalog
   - name: Orders
+    description:
+      "NOT YET IMPLEMENTED. This whole live open/build/checkout/void/clear
+
+      flow is target design only — no route under this tag exists in the
+
+      codebase. The only order-writing path actually built is the offline
+
+      batch endpoint `POST /sync/records`: the terminal PWA builds and
+
+      completes baskets client-side in local IndexedDB and pushes finished
+
+      orders here once connectivity allows. See that endpoint for what's
+
+      real today."
   - name: Receipts
+    description: NOT YET IMPLEMENTED — depends on the Orders/checkout flow above.
   - name: Refunds
+    description: NOT YET IMPLEMENTED — depends on the Orders/checkout flow above.
   - name: Reports
+    description: NOT YET IMPLEMENTED.
   - name: Inventory
   - name: Deliveries
   - name: Config
@@ -129,6 +152,63 @@ paths:
                     format: date-time
         "401":
           $ref: "#/components/responses/IncorrectCredentials"
+  /auth/admin/login:
+    post:
+      tags:
+        - Auth
+      summary: Admin login — exchanges the shared admin secret for a signed admin token
+      description:
+        "Mirrors manager login structurally, but there's no DB row or
+
+        username: the whole identity is possession of the shared
+
+        `ADMIN_SECRET_KEY`. Gates account provisioning that a regular
+
+        manager must never be able to do to themselves or each other:
+
+        creating/editing/deactivating manager accounts, and authoring or
+
+        editing recipes (no admin UI exists yet, so this is the only
+
+        non-seed way to create one).
+
+
+        `admin_token` is signed with a secret distinct from
+
+        `MANAGER_JWT_SECRET`, and is never accepted in place of a
+
+        `manager_token` or vice versa — the two are never combined on a
+
+        single route.
+        "
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - admin_key
+              properties:
+                admin_key:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  admin_token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                    description: 8h TTL, same as manager_token
+        "401":
+          $ref: "#/components/responses/IncorrectCredentials"
   /auth/manager/pin/verify:
     post:
       tags:
@@ -142,20 +222,36 @@ paths:
         specific person from this call.
 
 
-        On success returns a short-lived panel token. Per FR-004 and FR-031,
+        Public, like `/auth/manager/login` and `/auth/admin/login` — no
 
-        entering the panel is the ONLY gate — cash-out, refunds, voids, clear,
+        `activeSession` required. This has to be a cold-start entry point:
 
-        and cashier login inside the panel need no further PIN entry. The
+        it is the only way to obtain a `panel_token`, and opening the very
 
-        token covers the panel session, not a single action.
+        first shift session of the day (or the next one after any cash-out)
+
+        itself requires a `panel_token`. Gating this endpoint behind an
+
+        active session would mean there is never a way to get one. The PIN
+
+        check itself is the security boundary here, the same as the shared
+
+        secret on admin login.
+
+
+        On success returns the panel token. Per FR-004 and FR-031, entering
+
+        the panel is the ONLY gate — cash-out, refunds, voids, clear, and
+
+        cashier login inside the panel need no further PIN entry. The token
+
+        covers the panel session, not a single action.
 
 
         Swappable to card-swipe later without touching callers (NFR-018).
 
         "
-      security:
-        - activeSession: []
+      security: []
       requestBody:
         required: true
         content:
@@ -177,9 +273,12 @@ paths:
                 properties:
                   panel_token:
                     type: string
-                  expires_at:
-                    type: string
-                    format: date-time
+                    description:
+                      "The static, shared `PANEL_SECRET_KEY` value — not a
+                      signed or expiring token. Same trust level as the PIN
+                      itself (gate-only, no identity). There is nothing to
+                      expire: revoking it means rotating the env var, not
+                      waiting out a TTL."
         "401":
           $ref: "#/components/responses/IncorrectCredentials"
   /shift-sessions:
@@ -190,7 +289,17 @@ paths:
       description:
         'Reached from inside the Manager Panel ("Login Cashier"), so it
 
-        requires a valid `panel_token`.
+        requires a valid `panel_token`. `activeSession` is deliberately NOT
+
+        also required: this is the endpoint that creates the very first
+
+        session of the day (or the next one after a cash-out), so there is
+
+        nothing to hold a session token for yet. `activeSession` genuinely
+
+        applies to every other panel action (cash-out, void, clear, refund),
+
+        which operate on a session that already exists.
 
 
         Single atomic init: validates `cashier_pos_id` against an active
@@ -210,8 +319,7 @@ paths:
 
         '
       security:
-        - activeSession: []
-          panelToken: []
+        - panelToken: []
       requestBody:
         required: true
         content:
@@ -261,29 +369,6 @@ paths:
             immediately
         "409":
           description: A session is already open on this terminal
-  /shift-sessions/current:
-    get:
-      tags:
-        - Shift Sessions
-      summary: Recover an open session after a crash (FR-041)
-      description:
-        "\n        On crash/restart, the client calls this to check if\
-        \ a session was left\n        open. Returns it only if one exists (end_time\
-        \ is null); otherwise 404.\n        \n        This is NOT a \"get me the current\
-        \ session token\" endpoint — it's purely\n        for recovery. If the session\
-        \ exists, it also returns the open order\n        (if any) for immediate basket\
-        \ restoration.\n"
-      responses:
-        "200":
-          description: Open session
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ShiftSessionDetail"
-        "404":
-          description: No open session on this device — normal startup
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
   /shift-sessions/{session_id}/cash-out:
     post:
       tags:
@@ -332,6 +417,39 @@ paths:
           $ref: "#/components/responses/PanelRequired"
         "409":
           description: Session already closed, or an order is still open
+  /shift-sessions/current/cash-out:
+    post:
+      tags:
+        - Shift Sessions
+      summary: Cash out whatever session is currently open, without its session_token (recovery path)
+      description:
+        "Panel-token only — deliberately does **not** also require
+        `activeSession`, unlike the by-id cash-out above. For a device that
+        lost its stored `X-Session-Token` (or never had one for a session it
+        didn't itself open), this is the only way back to a closed terminal.
+
+
+        Single-terminal deployment, so \"current\" is never ambiguous: there
+        is at most one session with `end_time = null` at a time, by
+        construction of `POST /shift-sessions`'s own 409 check. Same
+        behavior as the by-id route otherwise — rejected while an order is
+        still open, same `ClosedSession` response shape.
+        "
+      security:
+        - panelToken: []
+      responses:
+        "200":
+          description: Session closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClosedSession"
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "404":
+          description: No session currently open on this terminal
+        "409":
+          description: An order is still open
   /categories:
     post:
       tags:
@@ -375,6 +493,7 @@ paths:
         \ availability based on\n        stock—normally true, but false if any ingredient\
         \ is critically low\n        (implementation detail, start with all true for\
         \ V1).\n"
+      security: []
       parameters:
         - name: include
           in: query
@@ -383,6 +502,7 @@ paths:
             enum:
               - products
           description: Eager-load each category's products
+        - $ref: "#/components/parameters/IncludeInactive"
       responses:
         "200":
           description: OK
@@ -449,8 +569,10 @@ paths:
       tags:
         - Catalog
       summary: List one category's products (FR-008)
+      security: []
       parameters:
         - $ref: "#/components/parameters/CategoryId"
+        - $ref: "#/components/parameters/IncludeInactive"
       responses:
         "200":
           description: OK
@@ -480,6 +602,7 @@ paths:
         pre-computed so the client never does pricing math.
 
         "
+      security: []
       parameters:
         - $ref: "#/components/parameters/ProductId"
       responses:
@@ -499,11 +622,11 @@ paths:
         - Catalog
       summary: Resolved recipe for a product, per size (FR-021, FR-022)
       description:
-        "Read-only view of exactly what checkout will deduct — useful for
+        "Read-only view of exactly what checkout will deduct. No admin UI
 
-        verifying seeded data, since there is no admin UI in V1 and recipes
+        exists yet — `POST`/`PATCH` on this resource (below) is the only
 
-        are entered by hand.
+        way to author a recipe outside the seed script.
 
 
         Returns one entry per size for recipe-based products, or a single
@@ -517,6 +640,7 @@ paths:
         multiplies by the line quantity.
 
         "
+      security: []
       parameters:
         - $ref: "#/components/parameters/ProductId"
         - name: modifier_id
@@ -535,6 +659,147 @@ paths:
                   $ref: "#/components/schemas/RecipeDetail"
         "404":
           description: Product not found, or no recipe seeded for it
+    post:
+      tags:
+        - Catalog
+      summary: Build a recipe for a product+size (admin-only)
+      description:
+        No admin UI exists elsewhere, so this is the only non-seed way to
+        create a recipe. Gated by adminToken alone — never combined with
+        managerToken.
+      security:
+        - adminToken: []
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - modifier_id
+                - ingredients
+              properties:
+                modifier_id:
+                  type: integer
+                  nullable: true
+                  description:
+                    Required for recipe_based products; must be null for
+                    reseller products
+                ingredients:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - item_id
+                      - unit
+                      - quantity
+                    properties:
+                      item_id:
+                        type: integer
+                      unit:
+                        type: string
+                        enum:
+                          - g
+                          - ml
+                          - piece
+                      quantity:
+                        type: number
+                        format: decimal
+                        description: Can be negative (e.g. a promo adjustment)
+      responses:
+        "201":
+          description: Recipe created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recipe:
+                    $ref: "#/components/schemas/RecipeDetail"
+        "400":
+          description:
+            Invalid modifier_id/item_id, modifier_id/product type mismatch,
+            or malformed body
+        "401":
+          $ref: "#/components/responses/AdminRequired"
+        "404":
+          description: Product not found
+        "409":
+          description: A recipe already exists for this product+modifier pair
+  /products/{product_id}/recipe/{recipe_id}:
+    patch:
+      tags:
+        - Catalog
+      summary: Edit an existing recipe (admin-only)
+      description:
+        Same gate as recipe creation. ingredients-only updates replace the
+        full ingredient list (old ones deleted, not merged).
+      security:
+        - adminToken: []
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+        - name: recipe_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                modifier_id:
+                  type: integer
+                  nullable: true
+                ingredients:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - item_id
+                      - unit
+                      - quantity
+                    properties:
+                      item_id:
+                        type: integer
+                      unit:
+                        type: string
+                        enum:
+                          - g
+                          - ml
+                          - piece
+                      quantity:
+                        type: number
+                        format: decimal
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recipe:
+                    $ref: "#/components/schemas/RecipeDetail"
+        "400":
+          description:
+            Empty body, invalid modifier_id/item_id, or modifier_id/product
+            type mismatch
+        "401":
+          $ref: "#/components/responses/AdminRequired"
+        "404":
+          description:
+            Product or recipe not found, or the recipe belongs to a
+            different product_id than the one in the path
+        "409":
+          description: modifier_id reassignment collides with another recipe on this product
   /orders:
     post:
       tags:
@@ -586,14 +851,16 @@ paths:
       description:
         "\n        Current business day only. No pagination — returns every\
         \ completed\n        order for today. Open orders are excluded (they don't\
-        \ sync and are\n        recoverable via GET /shift-sessions/current).\n  \
+        \ sync — an open basket is recovered client-side from local IndexedDB,\
+        \ not via any server endpoint; see FR-041 in the top-level description).\n  \
         \      \n        Filters by order_id (exact), around_time (approximate checkout\
         \ time),\n        transaction_type, status. Matching is on completed_at.\n"
       parameters:
         - name: order_id
           in: query
           schema:
-            type: integer
+            type: string
+            format: uuid
         - name: around_time
           in: query
           schema:
@@ -1014,7 +1281,8 @@ paths:
                       - quantity
                     properties:
                       line_item_id:
-                        type: integer
+                        type: string
+                        format: uuid
                         description: Line on the original sale being returned
                       quantity:
                         type: integer
@@ -1314,6 +1582,56 @@ paths:
           $ref: "#/components/responses/ManagerRequired"
         "404":
           description: Count entry not found
+    patch:
+      tags:
+        - Inventory
+      summary: Correct a physical count entry, same-day only (FR-027)
+      description:
+        "Editable only until the count-entry lock deadline: 03:00 Beirut
+
+        time on the calendar day after `entry_date` (not simply \"until
+
+        midnight\" — a count submitted late at night still has a same-day
+
+        edit window). Past the deadline, `400`.
+
+
+        Updates `physical_count` only — `item_id`, `manager_id`, and
+
+        `entry_date` are immutable.
+        "
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/CountId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - physical_count
+              properties:
+                physical_count:
+                  type: number
+                  format: decimal
+                  minimum: 0
+      responses:
+        "200":
+          description: Updated, variance recomputed against current current_stock
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryCountEntry"
+        "400":
+          description:
+            physical_count negative, or the lock deadline for entry_date
+            has passed
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Count entry not found
   /suppliers:
     get:
       tags:
@@ -1512,6 +1830,7 @@ paths:
         the server stores only LBP.
 
         "
+      security: []
       responses:
         "200":
           description: OK
@@ -1519,8 +1838,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExchangeRate"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: Exchange rate not configured yet (fresh/unseeded database)
     put:
       tags:
         - Config
@@ -1583,33 +1902,47 @@ paths:
     post:
       tags:
         - Sync
-      summary: Push queued local records to the cloud (FR-035, FR-037, FR-038)
+      summary: Push queued local orders to the cloud (FR-035, FR-037, FR-038)
       description:
-        "Local-first: the terminal commits every order, deduction and closed
+        "Orders only in V1 — the contract originally envisioned a generic
 
-        session to local storage BEFORE any sync is attempted. The closed
+        multi-type sync (shift sessions, deliveries, inventory counts too),
 
-        session is the cash-up record of FR-035. Records then sync
+        but only orders are built. Deliveries and inventory count entries
 
-        individually and immediately whenever connectivity allows, and the
+        are written directly by their own endpoints from the admin PC
 
-        reconciliation sweep retries anything unsynced every 10 minutes until
+        (always online in practice); shift-session open/cash-out are their
 
-        the cloud confirms it.
-
-
-        Each record is all-or-nothing. A partial or corrupted record is
-
-        rejected outright rather than half-accepted, and stays queued — no
-
-        partial state ever reaches the cloud (FR-037).
+        own live endpoints too. This is purely the offline POS order path.
 
 
-        Confirmed records come back with the server timestamp the client
+        Local-first: the terminal builds and completes every order in local
 
-        writes into `synced_at`, alongside `sync_status: synced`.
+        IndexedDB BEFORE any sync is attempted; this endpoint's only job is
 
+        to insert the finished order once there's connectivity. It is a
+
+        plain `order.create` per record, never an upsert — there is no
+
+        edit-after-submit path. Each record is independent: one bad record
+
+        (unknown session_id, unknown product_id/modifier_id, or a resend of
+
+        an order_id that's already synced) fails on its own without
+
+        affecting the rest of the batch, and nothing partial is written for
+
+        it. Schema-level validation failures (a required field missing, a
+
+        negative quantity, etc.) reject the whole batch before any record
+
+        is attempted, since that's a client bug rather than a per-record
+
+        sync conflict.
         "
+      security:
+        - managerToken: []
       requestBody:
         required: true
         content:
@@ -1625,25 +1958,84 @@ paths:
                   items:
                     type: object
                     required:
-                      - record_type
-                      - record_id
-                      - payload
+                      - order_id
+                      - session_id
+                      - total_due
+                      - created_at
+                      - line_items
                     properties:
-                      record_type:
+                      order_id:
+                        type: string
+                        description: Client-generated (offline); synced at most once
+                      session_id:
+                        type: string
+                        format: uuid
+                      transaction_type:
                         type: string
                         enum:
-                          - order
-                          - shift_session
-                          - delivery
-                          - inventory_count_entry
-                      record_id:
-                        type: integer
-                      payload:
-                        type: object
-                        description: The full local row
+                          - sale
+                          - refund
+                        default: sale
+                      order_type:
+                        type: string
+                        enum:
+                          - dine_in
+                          - take_out
+                        nullable: true
+                      status:
+                        type: string
+                        enum:
+                          - open
+                          - completed
+                        default: completed
+                      total_due:
+                        type: number
+                        format: decimal
+                        description: LBP; negative for refunds
+                      cash_tendered:
+                        type: number
+                        format: decimal
+                        nullable: true
+                        description: Must be >= 0 when present (positive on refunds too)
+                      change_given:
+                        type: number
+                        format: decimal
+                        nullable: true
+                      created_at:
+                        type: string
+                        format: date-time
+                        description: When the basket was opened on the device, client-supplied
+                      completed_at:
+                        type: string
+                        format: date-time
+                        nullable: true
+                        description: Required when status is completed
+                      line_items:
+                        type: array
+                        description: May be empty (a still-open, freshly opened basket)
+                        items:
+                          type: object
+                          required:
+                            - product_id
+                            - quantity
+                            - unit_price
+                          properties:
+                            product_id:
+                              type: integer
+                            modifier_id:
+                              type: integer
+                              nullable: true
+                            quantity:
+                              type: integer
+                              minimum: 1
+                              description: Always positive, even on refund lines
+                            unit_price:
+                              type: number
+                              format: decimal
+                              minimum: 0
       responses:
         "200":
-          description: Per-record results — confirmed or rejected
+          description: Per-record results — synced or failed. Always 200; failures are per-record, not a batch-level error.
           content:
             application/json:
               schema:
@@ -1654,10 +2046,8 @@ paths:
                     items:
                       type: object
                       properties:
-                        record_type:
+                        order_id:
                           type: string
-                        record_id:
-                          type: integer
                         sync_status:
                           type: string
                           enum:
@@ -1667,13 +2057,11 @@ paths:
                           type: string
                           format: date-time
                           nullable: true
-                          description: Server confirmation time; null when failed
-                        error:
-                          type: string
-                          nullable: true
-                          description: Reason, e.g. corrupted or partial record
+                          description: Server-assigned confirmation time; null when failed
+        "400":
+          description: Malformed request — schema validation failed for the whole batch
         "401":
-          $ref: "#/components/responses/Unauthenticated"
+          $ref: "#/components/responses/ManagerRequired"
   /suppliers/{supplier_id}:
     patch:
       tags:
@@ -1732,9 +2120,12 @@ paths:
     post:
       tags:
         - Managers
-      summary: Create a manager account
+      summary: Create a manager account (admin-only)
+      description:
+        Admin-only, so a regular manager can't provision more managers. A
+        valid managerToken alone, with no adminToken, grants no access here.
       security:
-        - managerToken: []
+        - adminToken: []
       requestBody:
         required: true
         content:
@@ -1766,7 +2157,7 @@ paths:
         "400":
           description: Missing required fields
         "401":
-          $ref: "#/components/responses/ManagerRequired"
+          $ref: "#/components/responses/AdminRequired"
         "409":
           description: Username already taken
     get:
@@ -1811,9 +2202,12 @@ paths:
     patch:
       tags:
         - Managers
-      summary: Update a manager account
+      summary: Update a manager account (admin-only)
+      description:
+        Admin-only — a manager cannot PATCH their own or anyone else's
+        record this way, even with a valid managerToken.
       security:
-        - managerToken: []
+        - adminToken: []
       parameters:
         - $ref: "#/components/parameters/ManagerId"
       requestBody:
@@ -1841,7 +2235,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Manager"
         "401":
-          $ref: "#/components/responses/ManagerRequired"
+          $ref: "#/components/responses/AdminRequired"
         "404":
           description: Manager not found
         "409":
@@ -1849,16 +2243,16 @@ paths:
     delete:
       tags:
         - Managers
-      summary: Deactivate a manager (soft delete)
+      summary: Deactivate a manager (soft delete, admin-only)
       security:
-        - managerToken: []
+        - adminToken: []
       parameters:
         - $ref: "#/components/parameters/ManagerId"
       responses:
         "204":
           description: Deactivated — is_active set to false
         "401":
-          $ref: "#/components/responses/ManagerRequired"
+          $ref: "#/components/responses/AdminRequired"
         "404":
           description: Manager not found
   /employees:
@@ -2111,14 +2505,26 @@ components:
       in: header
       name: X-Panel-Token
       description:
-        "Manager Panel open via the shared PIN (FR-010, AUTH-GATE-01).
-        Short
+        "Manager Panel open via the shared PIN (FR-010, AUTH-GATE-01). The
 
-        TTL, carries no identity. Covers everything inside the panel: cashier
+        raw, static `PANEL_SECRET_KEY` — not a signed or expiring token, and
 
-        login, cash-out, voids, clear, refunds. Only ever valid alongside a
+        carries no identity. Revoking it means rotating the env var, not
 
-        live session — the PIN alone grants nothing.
+        waiting out a TTL.
+
+
+        Covers everything inside the panel: cashier login, cash-out, voids,
+
+        clear, refunds. Valid standalone for cashier login (`POST
+
+        /shift-sessions`) and the recovery cash-out (`POST
+
+        /shift-sessions/current/cash-out`), since both can be reached with
+
+        no session yet open or already gone; every other panel action
+
+        additionally requires a live `activeSession` alongside it.
 
         "
     managerToken:
@@ -2134,25 +2540,52 @@ components:
         Also a server-side session record, same rules as above.
 
         "
+    adminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description:
+        "Possession of the shared `ADMIN_SECRET_KEY`, exchanged for a signed
+
+        token via `POST /auth/admin/login`. No DB row, no username — carries
+
+        no identity beyond \"holds the admin secret\".
+
+
+        Gates manager account provisioning (`POST /managers`, `PATCH`/`DELETE
+
+        /managers/{manager_id}`) and recipe authoring (`POST`/`PATCH
+
+        /products/{product_id}/recipe...`) exclusively — a valid
+
+        `managerToken` never substitutes for this, and the two are never
+
+        combined on a single route. Otherwise any manager could edit or
+
+        deactivate any other manager's account.
+        "
   parameters:
     SessionId:
       name: session_id
       in: path
       required: true
       schema:
-        type: integer
+        type: string
+        format: uuid
     OrderId:
       name: order_id
       in: path
       required: true
       schema:
-        type: integer
+        type: string
+        format: uuid
     LineItemId:
       name: line_item_id
       in: path
       required: true
       schema:
-        type: integer
+        type: string
+        format: uuid
     CategoryId:
       name: category_id
       in: path
@@ -2176,13 +2609,15 @@ components:
       in: path
       required: true
       schema:
-        type: integer
+        type: string
+        format: uuid
     DeliveryId:
       name: delivery_id
       in: path
       required: true
       schema:
-        type: integer
+        type: string
+        format: uuid
     ManagerId:
       name: manager_id
       in: path
@@ -2239,6 +2674,14 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    AdminRequired:
+      description:
+        Admin authentication required — a valid managerToken alone does
+        not grant access here
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     OrderNotOpen:
       description: Order is not open — completed orders cannot be modified
       content:
@@ -2259,7 +2702,8 @@ components:
       type: object
       properties:
         session_id:
-          type: integer
+          type: string
+          format: uuid
         cashier_pos_id:
           type: integer
         starting_float:
@@ -2291,17 +2735,11 @@ components:
         - $ref: "#/components/schemas/ShiftSession"
         - type: object
           properties:
-            cashier_first_name:
+            cashier_name:
               type: string
-              description: From the joined employee row — terminal header (FR-007)
-            cashier_last_name:
-              type: string
-            open_order:
-              type: object
-              allOf:
-                - $ref: "#/components/schemas/OrderDetail"
-              nullable: true
-              description: The recoverable basket, if one was open (FR-041)
+              description:
+                Full name ("First Last"), from the joined employee row —
+                terminal header (FR-007)
     ClosedSession:
       allOf:
         - $ref: "#/components/schemas/ShiftSession"
@@ -2433,9 +2871,11 @@ components:
       type: object
       properties:
         order_id:
-          type: integer
+          type: string
+          format: uuid
         session_id:
-          type: integer
+          type: string
+          format: uuid
         transaction_type:
           type: string
           enum:
@@ -2484,9 +2924,6 @@ components:
           type: string
           format: date-time
           nullable: true
-        order_number:
-          type: integer
-          description: Sequential receipt number starting at 100, unique per order
     OrderDetail:
       allOf:
         - $ref: "#/components/schemas/Order"
@@ -2500,9 +2937,11 @@ components:
       type: object
       properties:
         line_item_id:
-          type: integer
+          type: string
+          format: uuid
         order_id:
-          type: integer
+          type: string
+          format: uuid
         product_id:
           type: integer
         product_name:
@@ -2517,7 +2956,11 @@ components:
           nullable: true
         quantity:
           type: integer
-          description: Negative on refund orders
+          description:
+            Always positive, even on refund lines — the refund's negative
+            sign lives on the order's total_due, not per-line quantity (the
+            only order-writing path built so far, POST /sync/records,
+            enforces quantity > 0 unconditionally)
         unit_price:
           type: number
           format: decimal
@@ -2541,7 +2984,8 @@ components:
             From transaction_type — REFUND prints at the top for refunds
             (FR-034)
         order_id:
-          type: integer
+          type: string
+          format: uuid
         cashier_first_name:
           type: string
         cashier_last_name:
@@ -2653,7 +3097,8 @@ components:
       type: object
       properties:
         count_id:
-          type: integer
+          type: string
+          format: uuid
         item_id:
           type: integer
         item_name:
@@ -2701,7 +3146,8 @@ components:
       type: object
       properties:
         delivery_id:
-          type: integer
+          type: string
+          format: uuid
         manager_id:
           type: integer
         supplier_id:
