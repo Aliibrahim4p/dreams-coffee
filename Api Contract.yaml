@@ -1,0 +1,2819 @@
+openapi: 3.0.3
+info:
+  title: POS System API
+  version: 1.0.0
+  description: |
+    V1 API for the dual-currency POS system.
+
+    CURRENCY: every monetary field is LBP. USD→LBP conversion happens
+    client-side (FR-017, NFR-001); the server never receives or stores USD.
+
+    ACTORS (no RBAC — three fixed types):
+      - Manager: username + password -> `manager_token` (NFR-009). Required
+        for the admin-PC surface (inventory counts, deliveries, config). The
+        same login and the same token are used from the POS terminal and
+        from the admin PC — one credential, two interfaces, no separate
+        terminal-unlock state to track.
+      - Shared manager PIN: a gate, not an identity (AUTH-GATE-01). Opens the
+        Manager Panel (FR-010). Everything reachable inside that panel —
+        cashier login, cash-out, voids, clear, refunds — is covered by that
+        single panel entry and is NOT separately gated.
+      - Cashier: POS ID only, identity-only, not a security boundary.
+
+    ACCESS MODEL: ACTIVE CASH SESSION ON THIS DEVICE. A `shift_session` row
+    with `end_time = null`. Every transaction endpoint checks this and
+    nothing more — not a live manager credential. The cashier operates
+    alone all day on the strength of that open row. Cash-out sets
+    `end_time`, which kills the session: transactions stop working until a
+    new one is opened -> 409.
+
+    So a sale asks "is there an open, un-cashed-out session here?", a DB
+    state check, not "who is authenticated right now".
+
+    HARDWARE: the 24V drawer pulse and the thermal print job are client-side
+    (FR-003, FR-018). The server signals when to fire them; it never touches
+    the port. This is what makes FR-043 work — a printer failure is entirely
+    client-side and cannot roll back a committed checkout.
+
+    NOT ENDPOINTS (deliberately):
+      - FR-012 / FR-016 basket lock. Entering and cancelling the payment flow
+        is client-side screen state. The server has no "locked" status — an
+        order is open or completed. Cancelling out of payment needs no call;
+        the basket was never touched server-side.
+      - FR-015 sequential split payments. Superseded: the agreed model stores
+        a single `cash_tendered` total per order, not a payment ledger. The
+        cashier sums tender client-side and posts one figure at checkout.
+        Multi-payment intake would need a `payment` table, which was
+        deliberately removed from the schema.
+      - FR-039 remote administrator dashboard. Out of scope for the terminal
+        API — served from the cloud DB directly by the engineering lead in
+        V1, with no authenticated actor in this contract. A proper admin
+        surface is a V1.1 addition.
+      - FR-017 USD→LBP conversion, client-side per NFR-001.
+servers:
+  - url: /api/v1
+tags:
+  - name: Auth
+    description: Manager login, PIN gate, cashier login
+  - name: Shift Sessions
+  - name: Catalog
+  - name: Orders
+  - name: Receipts
+  - name: Refunds
+  - name: Reports
+  - name: Inventory
+  - name: Deliveries
+  - name: Config
+  - name: Sync
+  - name: Managers
+  - name: Employees
+security:
+  - activeSession: []
+paths:
+  /auth/manager/login:
+    post:
+      tags:
+        - Auth
+      summary: Manager login (FR-001, NFR-009)
+      description:
+        "Validates manager username/password against `manager.password_hash`
+
+        (NFR-009) and returns a `manager_token` — the credential every
+
+        subsequent manager-scoped request is checked against.
+
+
+        This is also how a manager gets into the Manager Panel on the POS
+
+        terminal and into the admin-PC surface (inventory, deliveries,
+
+        config): same login, same token, just a different interface
+
+        depending on which device it's used from. There is no separate
+
+        terminal-unlock state — holding a valid `manager_token` is what
+
+        that used to mean.
+
+        "
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  manager_token:
+                    type: string
+                    description:
+                      For manager-scoped endpoints — inventory, deliveries,
+                      config
+                  expires_at:
+                    type: string
+                    format: date-time
+        "401":
+          $ref: "#/components/responses/IncorrectCredentials"
+  /auth/manager/pin/verify:
+    post:
+      tags:
+        - Auth
+      summary: Verify the shared manager PIN — opens the Manager Panel (FR-010, AUTH-GATE-01)
+      description:
+        "Checks the submitted PIN against `app_config` key `manager_pin`.
+
+        Gate-only: carries no manager identity, so nothing is attributed to a
+
+        specific person from this call.
+
+
+        On success returns a short-lived panel token. Per FR-004 and FR-031,
+
+        entering the panel is the ONLY gate — cash-out, refunds, voids, clear,
+
+        and cashier login inside the panel need no further PIN entry. The
+
+        token covers the panel session, not a single action.
+
+
+        Swappable to card-swipe later without touching callers (NFR-018).
+
+        "
+      security:
+        - activeSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - pin
+              properties:
+                pin:
+                  type: string
+      responses:
+        "200":
+          description: PIN accepted, Manager Panel open
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  panel_token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        "401":
+          $ref: "#/components/responses/IncorrectCredentials"
+  /shift-sessions:
+    post:
+      tags:
+        - Shift Sessions
+      summary: Log in a cashier and open a shift session (FR-002)
+      description:
+        'Reached from inside the Manager Panel ("Login Cashier"), so it
+
+        requires a valid `panel_token`.
+
+
+        Single atomic init: validates `cashier_pos_id` against an active
+
+        `employee` row and stores `starting_float` (> 0). Both are saved in
+
+        one step — the session does not begin, and product selection stays
+
+        disabled, until both are provided.
+
+
+        Returns the cashier''s full name for the terminal header (FR-007) and
+
+        signals the client to fire the 24V drawer pulse so the float can be
+
+        put in (FR-003).
+
+        '
+      security:
+        - activeSession: []
+          panelToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cashier_pos_id
+                - starting_float
+              properties:
+                cashier_pos_id:
+                  type: integer
+                starting_float:
+                  type: number
+                  format: decimal
+                  minimum: 0
+                  exclusiveMinimum: true
+                  description: LBP, must be > 0
+      responses:
+        "201":
+          description: Session opened
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ShiftSessionDetail"
+                  - type: object
+                    properties:
+                      session_token:
+                        type: string
+                        description:
+                          "Sent as X-Session-Token on every transaction from
+
+                          here on. Valid until cash-out sets end_time.
+
+                          "
+                      trigger_drawer_pulse:
+                        type: boolean
+                        description: Always true — client fires the 24V pulse (FR-003)
+        "400":
+          description: starting_float missing or <= 0
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "404":
+          description:
+            cashier_pos_id does not match any active employee — init fails
+            immediately
+        "409":
+          description: A session is already open on this terminal
+  /shift-sessions/current:
+    get:
+      tags:
+        - Shift Sessions
+      summary: Recover an open session after a crash (FR-041)
+      description:
+        "\n        On crash/restart, the client calls this to check if\
+        \ a session was left\n        open. Returns it only if one exists (end_time\
+        \ is null); otherwise 404.\n        \n        This is NOT a \"get me the current\
+        \ session token\" endpoint — it's purely\n        for recovery. If the session\
+        \ exists, it also returns the open order\n        (if any) for immediate basket\
+        \ restoration.\n"
+      responses:
+        "200":
+          description: Open session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShiftSessionDetail"
+        "404":
+          description: No open session on this device — normal startup
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /shift-sessions/{session_id}/cash-out:
+    post:
+      tags:
+        - Shift Sessions
+      summary: Cash out and close the shift (FR-004)
+      description:
+        "Manager Panel only — the `panel_token` from the PIN gate is the
+
+        whole authentication (FR-004: no separate auth beyond panel access).
+
+
+        Sets `shift_session.end_time` — that is the entire cash-out. There is
+
+        no separate cash-out record: the closed session IS it. `gross_sales`
+
+        is computed from the session's completed orders and returned for
+
+        display, not stored, so it can never drift from the orders it sums.
+
+
+        Ends the session: `X-Session-Token` stops working immediately and
+
+        every transaction endpoint returns 401 until a new session opens.
+
+
+        Drawer counting and reconciliation are manual and out of scope for V1.
+
+        Rejected while an order is still open — finish or clear the basket
+
+        first.
+
+        "
+      security:
+        - activeSession: []
+          panelToken: []
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Session closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClosedSession"
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "409":
+          description: Session already closed, or an order is still open
+  /categories:
+    post:
+      tags:
+        - Catalog
+      summary: Create a category
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        "201":
+          description: Category created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "409":
+          description: Category name already exists
+    get:
+      tags:
+        - Catalog
+      summary: List categories, optionally eager-loading their products (FR-008)
+      description:
+        "\n        Eager-load categories with all products and their available\
+        \ sizes.\n        With this single call the client has the whole menu and\
+        \ can switch\n        category/product/size instantly with no follow-up requests.\n\
+        \        \n        Sizes are returned pre-computed with their price adjustments.\
+        \ Reseller\n        products show all sizes marked available:false (greyed\
+        \ out). Recipe-based\n        products return their seederd sizes, each with\
+        \ availability based on\n        stock—normally true, but false if any ingredient\
+        \ is critically low\n        (implementation detail, start with all true for\
+        \ V1).\n"
+      parameters:
+        - name: include
+          in: query
+          schema:
+            type: string
+            enum:
+              - products
+          description: Eager-load each category's products
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CategoryWithProducts"
+  /categories/{category_id}:
+    patch:
+      tags:
+        - Catalog
+      summary: Rename a category
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/CategoryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Category not found
+        "409":
+          description: Name already taken
+    delete:
+      tags:
+        - Catalog
+      summary: Deactivate a category (soft delete)
+      description:
+        Deactivating a category hides it from the POS catalog. Products
+        under it are not deactivated automatically — deactivate them separately if
+        needed.
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/CategoryId"
+      responses:
+        "204":
+          description: Deactivated — is_active set to false
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Category not found
+  /categories/{category_id}/products:
+    get:
+      tags:
+        - Catalog
+      summary: List one category's products (FR-008)
+      parameters:
+        - $ref: "#/components/parameters/CategoryId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Product"
+        "404":
+          description: Category not found
+  /products/{product_id}/sizes:
+    get:
+      tags:
+        - Catalog
+      summary: Sizes available for a product, with resolved prices (FR-009)
+      description:
+        "Derived from the `recipe` rows that exist for this product. A
+
+        recipe-based drink returns one entry per size; a reseller product
+
+        returns a single entry with `modifier_id: null`.
+
+
+        `resolved_price` is `product.base_price + size_modifier.price_adjustment`,
+
+        pre-computed so the client never does pricing math.
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProductSizeOption"
+        "404":
+          description: Product not found
+  /products/{product_id}/recipe:
+    get:
+      tags:
+        - Catalog
+      summary: Resolved recipe for a product, per size (FR-021, FR-022)
+      description:
+        "Read-only view of exactly what checkout will deduct — useful for
+
+        verifying seeded data, since there is no admin UI in V1 and recipes
+
+        are entered by hand.
+
+
+        Returns one entry per size for recipe-based products, or a single
+
+        entry with `modifier_id: null` for resellers. A reseller's list is
+
+        always one ingredient at quantity 1 in `piece`; selling 3 deducts 3
+
+        pieces (FR-022). Quantities shown are per single unit sold — checkout
+
+        multiplies by the line quantity.
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+        - name: modifier_id
+          in: query
+          schema:
+            type: integer
+          description: Return only this size's recipe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RecipeDetail"
+        "404":
+          description: Product not found, or no recipe seeded for it
+  /orders:
+    post:
+      tags:
+        - Orders
+      summary: Open a new order with first item (automatically opened on first add)
+      description:
+        "\n        Technically, POST /orders/{id}/line-items (adding the\
+        \ first item)\n        auto-creates the order if none is open. But clients\
+        \ MAY call this\n        endpoint explicitly to pre-open a basket before scanning\
+        \ items.\n        \n        If called when one is already open, returns 409.\n"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - order_type
+              properties:
+                order_type:
+                  type: string
+                  enum:
+                    - dine_in
+                    - take_out
+                line_items:
+                  type: array
+                  description:
+                    Optional — the basket may also be built up one item
+                    at a time
+                  items:
+                    $ref: "#/components/schemas/LineItemInput"
+      responses:
+        "201":
+          description: Order opened
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "400":
+          description: Invalid order_type, product_id, or modifier_id
+        "409":
+          description: An order is already open on this session
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    get:
+      tags:
+        - Orders
+      summary: Search today's completed orders (same-day only, all results)
+      description:
+        "\n        Current business day only. No pagination — returns every\
+        \ completed\n        order for today. Open orders are excluded (they don't\
+        \ sync and are\n        recoverable via GET /shift-sessions/current).\n  \
+        \      \n        Filters by order_id (exact), around_time (approximate checkout\
+        \ time),\n        transaction_type, status. Matching is on completed_at.\n"
+      parameters:
+        - name: order_id
+          in: query
+          schema:
+            type: integer
+        - name: around_time
+          in: query
+          schema:
+            type: string
+            format: time
+          description: Approximate checkout time, e.g. 14:30
+        - name: transaction_type
+          in: query
+          schema:
+            type: string
+            enum:
+              - sale
+              - refund
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - open
+              - completed
+      responses:
+        "200":
+          description: Today's matching orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /orders/{order_id}:
+    get:
+      tags:
+        - Orders
+      summary: Get an order with its line items (FR-006)
+      description:
+        "\n        Returns the order with its line items. Only valid while\
+        \ status=open\n        (completed orders are immutable). Completed orders\
+        \ sync to the cloud\n        (sync_status moves to 'synced'); open orders\
+        \ never sync.\n"
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "404":
+          description: Order not found
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /orders/{order_id}/line-items:
+    post:
+      tags:
+        - Orders
+      summary: Add a line item to the open basket (FR-006, FR-016)
+      description:
+        "No authentication — adding is never gated (FR-016). Only valid
+        while
+
+        `status: open`.
+
+
+        Never blocked by stock level, however low or negative (FR-042).
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LineItemInput"
+      responses:
+        "200":
+          description: Added — full order returned with recalculated total
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "400":
+          description: Invalid product_id, modifier_id, or quantity < 1
+        "409":
+          $ref: "#/components/responses/OrderNotOpen"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /orders/{order_id}/line-items/{line_item_id}:
+    patch:
+      tags:
+        - Orders
+      summary: Change quantity or size on a line item (FR-009, FR-016)
+      description:
+        "No authentication — quantity and modifier changes are explicitly
+
+        ungated (FR-016). Only valid while `status: open`.
+
+
+        Changing `modifier_id` re-snapshots `unit_price` from the new size's
+
+        `price_adjustment` and re-points the line at that size's recipe, so
+
+        both the price and the eventual ingredient deduction follow the new
+
+        size (FR-009). The recalculated price comes back in the response.
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+        - $ref: "#/components/parameters/LineItemId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                quantity:
+                  type: integer
+                  minimum: 1
+                modifier_id:
+                  type: integer
+                  nullable: true
+                  description: New size; null only for reseller products
+      responses:
+        "200":
+          description: Updated — full order returned with recalculated total
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "400":
+          description: quantity < 1, or modifier_id has no recipe for this product
+        "404":
+          description: Line item not found on this order
+        "409":
+          $ref: "#/components/responses/OrderNotOpen"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    delete:
+      tags:
+        - Orders
+      summary: Void a line item (FR-005, FR-029, AUTH-GATE-01)
+      description:
+        "Requires a `panel_token` — the manager PIN gate. If it is missing,
+
+        invalid, or expired, the void does not execute and the item remains
+
+        unchanged in the basket.
+
+
+        Removes exactly the selected line and recalculates the total
+
+        immediately. Only valid while `status: open`.
+
+        "
+      security:
+        - activeSession: []
+          panelToken: []
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+        - $ref: "#/components/parameters/LineItemId"
+      responses:
+        "200":
+          description: Line removed — full order returned with recalculated total
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "404":
+          description: Line item not found on this order
+        "409":
+          $ref: "#/components/responses/OrderNotOpen"
+  /orders/{order_id}/clear:
+    post:
+      tags:
+        - Orders
+      summary: Clear the whole basket (FR-030, AUTH-GATE-01)
+      description:
+        "Requires a `panel_token`. On failure nothing is removed and the
+
+        basket is left exactly as it was.
+
+
+        Removes every line item and resets `total_due` to 0. The order row
+
+        itself survives and stays open, ready to be rebuilt.
+
+        "
+      security:
+        - activeSession: []
+          panelToken: []
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: Basket emptied, total reset to 0
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderDetail"
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "409":
+          $ref: "#/components/responses/OrderNotOpen"
+  /orders/{order_id}/checkout:
+    post:
+      tags:
+        - Orders
+      summary:
+        Complete the sale — atomic deduct + close (FR-014, FR-018, FR-020,
+        FR-021, FR-022)
+      description:
+        "The single atomic transaction. Inventory deduction and checkout
+
+        confirmation succeed or fail together — neither can complete without
+
+        the other (FR-020).
+
+
+        Deduction is recipe-driven for every product type. For each line, the
+
+        server resolves the recipe for `(product_id, modifier_id)` and
+
+        deducts `recipe_ingredient.quantity × line.quantity` from each
+
+        ingredient's `current_stock`. Recipe-based drinks deduct exact
+
+        weights and volumes for the selected size (FR-021); reseller products
+
+        have a single ingredient at quantity 1 in `piece`, so selling 3
+
+        bottles deducts 3 pieces (FR-022).
+
+
+        If an ingredient falls below zero the sale still completes
+
+        uninterrupted — the server sets `is_negative_flag` and keeps the exact
+
+        negative value in `current_stock` for the manager's inventory view
+
+        (FR-028). Nothing is surfaced to the cashier.
+
+
+        `cash_tendered` arrives already converted to LBP (FR-017, NFR-001).
+
+        `change_given` is computed and stored server-side. With
+
+        `exact_tender_confirmed: true` the order closes immediately with zero
+
+        change and no numeric entry required (FR-014).
+
+
+        Sets `completed_at` — the receipt timestamp and the basis for
+
+        same-day search. On success the response tells the client to fire the
+
+        drawer pulse and the print job (FR-018); if the printer then fails,
+
+        checkout stays committed and the receipt remains reprintable (FR-043).
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cash_tendered:
+                  type: number
+                  format: decimal
+                  description:
+                    LBP, already converted client-side. Omit when exact_tender_confirmed
+                    is true.
+                exact_tender_confirmed:
+                  type: boolean
+                  default: false
+                  description:
+                    Exact tender received — close with zero change, skip
+                    numeric entry (FR-014)
+      responses:
+        "200":
+          description: Order completed, stock deducted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/OrderDetail"
+                  - type: object
+                    properties:
+                      trigger_drawer_pulse:
+                        type: boolean
+                      receipt:
+                        $ref: "#/components/schemas/Receipt"
+        "409":
+          description: Order already completed, or basket is empty
+        "422":
+          description:
+            cash_tendered is below total_due and exact_tender_confirmed
+            is not set
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /orders/{order_id}/receipt:
+    get:
+      tags:
+        - Receipts
+      summary: Receipt payload for printing or reprint (FR-019, FR-034, FR-043, FR-046)
+      description:
+        "Returns exactly the fields FR-019 mandates: cashier first and
+        last
+
+        name, POS ID, date and time to the minute, every line item with
+
+        quantity and price, order type, total balance, amount paid, and
+
+        change issued. The client renders and prints; the server does not
+
+        format.
+
+
+        `header` is `SALE` or `REFUND`, taken from the order's
+
+        `transaction_type` — a refund prints the same layout with REFUND at
+
+        the top and the returned amount in LBP (FR-034).
+
+
+        Same-day only, and reprintable any number of times — which is how a
+
+        receipt that failed to print recovers once the printer is back
+
+        (FR-043, FR-046).
+
+        "
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "404":
+          description: Order not found, not completed, or not from today
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /orders/{order_id}/refund:
+    post:
+      tags:
+        - Refunds
+      summary: Refund a completed sale (FR-031, FR-032, FR-033, FR-034)
+      description:
+        "Manager Panel only — the `panel_token` is the whole authentication
+
+        (FR-031: no additional auth beyond panel access). Not attributed to
+
+        a named manager: the PIN carries no identity and none is recorded.
+
+
+        Creates a NEW `orders` row with `transaction_type: refund` and
+
+        negative `total_due`; the returned items are ordinary
+
+        `order_line_item` rows with negative `quantity`. There is no FK back
+
+        to the original sale — the stapled paper receipt is the link, matching
+
+        the floor procedure.
+
+
+        Atomically, the instant it is confirmed: subtracts the refunded LBP
+
+        from `shift_session.live_cash_total` (FR-032) and adds the exact
+
+        ingredient quantities back to stock by resolving each line's recipe
+
+        (FR-033).
+
+
+        `{order_id}` identifies the sale being refunded so its line prices and
+
+        recipes can be read; the refund itself is a separate order and gets
+
+        its own id.
+
+        "
+      security:
+        - activeSession: []
+          panelToken: []
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - line_items
+              properties:
+                line_items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - line_item_id
+                      - quantity
+                    properties:
+                      line_item_id:
+                        type: integer
+                        description: Line on the original sale being returned
+                      quantity:
+                        type: integer
+                        minimum: 1
+                        description:
+                          Units returned; stored negative on the refund
+                          order
+      responses:
+        "201":
+          description: Refund order created, cash and stock adjusted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/OrderDetail"
+                  - type: object
+                    properties:
+                      trigger_drawer_pulse:
+                        type: boolean
+                      receipt:
+                        $ref: "#/components/schemas/Receipt"
+        "401":
+          $ref: "#/components/responses/PanelRequired"
+        "404":
+          description: Original order not found or not completed
+        "422":
+          description: quantity exceeds what was sold on that line
+  /reports/daily-sales:
+    get:
+      tags:
+        - Reports
+      summary: Live daily sales totals (FR-023)
+      description:
+        "\n        Computed on demand from today's completed orders — never\
+        \ stored.\n        \n        Accessible by any open shift session (activeSession)\
+        \ — returns today's\n        totals only. Manager token (admin PC) has the\
+        \ same scope in V1: today's\n        sales only. Historical reporting (any\
+        \ date, any manager access level) is\n        a V1.1 feature.\n"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailySalesReport"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /inventory-items:
+    post:
+      tags:
+        - Inventory
+      summary: Create an inventory item
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - unit
+                - count_frequency
+              properties:
+                name:
+                  type: string
+                unit:
+                  type: string
+                  enum:
+                    - g
+                    - ml
+                    - piece
+                count_frequency:
+                  type: string
+                  enum:
+                    - daily
+                    - monthly
+      responses:
+        "201":
+          description: Item created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryItem"
+        "400":
+          description: Missing or invalid fields
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "409":
+          description: Item name already exists
+    get:
+      tags:
+        - Inventory
+      summary: List inventory items for a count cycle (FR-024, FR-045)
+      description:
+        "Filter by `count_frequency` to get exactly the count template
+        for
+
+        that cycle — the template shows only items matching the selected
+
+        frequency (FR-045).
+
+
+        This is also the predefined dropdown source for delivery and count
+
+        entry. Free-text item creation is disabled in V1: anything not in
+
+        this list is rejected (FR-024).
+
+
+        `current_stock` is the theoretical system stock the manager's count
+
+        will be compared against, and may be negative (FR-028).
+
+        "
+      security:
+        - managerToken: []
+      parameters:
+        - name: count_frequency
+          in: query
+          schema:
+            type: string
+            enum:
+              - daily
+              - monthly
+        - name: negative_only
+          in: query
+          schema:
+            type: boolean
+          description: Only items flagged negative (FR-028)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InventoryItem"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /inventory-items/{item_id}/pack-configurations:
+    get:
+      tags:
+        - Inventory
+      summary: Pack sizes available for an item (FR-025)
+      description:
+        'Every purchasable unit for this item, each with how many base
+        units
+
+        it yields — e.g. Sugar as Box (20000 sachets), Bag (100), Sachet (1).
+
+        Nesting is flattened at seed time, so `base_unit_qty` is always in
+
+        base units and never relative to another pack.
+
+
+        The delivery form uses this to build its unit dropdown. Picking the
+
+        pack IS the unit selection, which is what stops "24" being ambiguous
+
+        between 24 litres and 24 boxes.
+
+        '
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PackConfiguration"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Item not found
+  /inventory-count-entries:
+    post:
+      tags:
+        - Inventory
+      summary: Submit a physical stock count (FR-026, FR-027)
+      description:
+        "Manager username/password required — counts are done on the admin
+        PC,
+
+        not the POS, and are attributed to a named manager.
+
+
+        Saved against the current business date. `variance` is returned
+
+        (`physical_count − current_stock`) but never stored — it is derived,
+
+        and storing it would let it drift from the stock it describes.
+
+
+        One entry per item per day. Resubmitting the same item today is a
+
+        PATCH, not a second POST.
+
+        "
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - item_id
+                - physical_count
+              properties:
+                item_id:
+                  type: integer
+                physical_count:
+                  type: number
+                  format: decimal
+                  minimum: 0
+      responses:
+        "201":
+          description: Count recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryCountEntry"
+        "400":
+          description: item_id not in the predefined list (FR-024)
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "409":
+          description: An entry already exists for this item today — PATCH it instead
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+                  message:
+                    type: string
+                  count_id:
+                    type: integer
+                    description: Existing entry ID — use this for PATCH
+    get:
+      tags:
+        - Inventory
+      summary: List count entries for a date
+      security:
+        - managerToken: []
+      parameters:
+        - name: entry_date
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Defaults to today
+        - name: item_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InventoryCountEntry"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /inventory-count-entries/{count_id}:
+    get:
+      tags:
+        - Inventory
+      summary: Get a single count entry by ID
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/CountId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryCountEntry"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Count entry not found
+  /suppliers:
+    get:
+      tags:
+        - Deliveries
+      summary: List suppliers
+      security:
+        - managerToken: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Supplier"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+    post:
+      tags:
+        - Deliveries
+      summary: Create a new supplier (seeded data in V1; admin UI in V1.1)
+      security:
+        - managerToken: []
+      description:
+        In V1, suppliers are typically seeded by hand and this endpoint
+        is rarely called. Admin UI for CRUD is a V1.1 feature.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        "201":
+          description: Supplier created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Supplier"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /deliveries:
+    post:
+      tags:
+        - Deliveries
+      summary: Record a delivery and add its stock (FR-025, FR-044)
+      description:
+        'Manager username/password required — deliveries are entered on
+        the
+
+        admin PC and attributed to a named manager.
+
+
+        Records item, supplier, quantity received, cost per unit and date
+
+        received. Each line names a `config_id`, so `qty_received` is a count
+
+        of THAT pack — 2 Boxes of Milk, not 24 litres. The server multiplies
+
+        by `base_unit_qty` and commits the result to `current_stock`.
+
+
+        Both the raw entry and the resolved quantity are kept, so the record
+
+        still reads "2 boxes" months later rather than a bare +24.
+
+
+        The same item may appear on several lines in different pack sizes.
+
+        '
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - supplier_id
+                - date_received
+                - line_items
+              properties:
+                supplier_id:
+                  type: integer
+                date_received:
+                  type: string
+                  format: date
+                notes:
+                  type: string
+                  nullable: true
+                  description: Discrepancies, partial shipments, damaged goods
+                line_items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - item_id
+                      - config_id
+                      - qty_received
+                      - cost_per_unit
+                    properties:
+                      item_id:
+                        type: integer
+                      config_id:
+                        type: integer
+                        description: Which pack unit was received
+                      qty_received:
+                        type: number
+                        format: decimal
+                        minimum: 0
+                        exclusiveMinimum: true
+                        description: How many of that pack
+                      cost_per_unit:
+                        type: number
+                        format: decimal
+                        description: LBP per one of that pack
+      responses:
+        "201":
+          description: Delivery recorded, stock updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeliveryDetail"
+        "400":
+          description:
+            item_id not in the predefined list, or config_id does not belong
+            to that item
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+    get:
+      tags:
+        - Deliveries
+      summary: List deliveries
+      security:
+        - managerToken: []
+      parameters:
+        - name: date_received
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: supplier_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeliveryDetail"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /deliveries/{delivery_id}:
+    get:
+      tags:
+        - Deliveries
+      summary: Get one delivery with its lines
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/DeliveryId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeliveryDetail"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Delivery not found
+  /config/exchange-rate:
+    get:
+      tags:
+        - Config
+      summary: Current LBP-per-USD rate (FR-013)
+      description:
+        "The single active rate, read from `app_config`. The client caches
+        it
+
+        and does all conversion locally with no server round-trip (NFR-001);
+
+        the server stores only LBP.
+
+        "
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExchangeRate"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    put:
+      tags:
+        - Config
+      summary: Update the exchange rate (FR-013)
+      description: Manager username/password required.
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - rate_value
+              properties:
+                rate_value:
+                  type: number
+                  format: decimal
+                  minimum: 0
+                  exclusiveMinimum: true
+      responses:
+        "200":
+          description: Rate updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExchangeRate"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /sync/heartbeat:
+    get:
+      tags:
+        - Sync
+      summary: Connectivity check (FR-036, FR-040)
+      description:
+        "Polled every 5 seconds. Two consecutive misses (10 seconds) put
+        the
+
+        client into offline mode within 1 second: orders and payments keep
+
+        being accepted locally, a persistent banner shows, and records queue
+
+        for sync. Cashier input is never blocked by connection loss.
+
+        "
+      security: []
+      responses:
+        "200":
+          description: Online
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server_time:
+                    type: string
+                    format: date-time
+  /sync/records:
+    post:
+      tags:
+        - Sync
+      summary: Push queued local records to the cloud (FR-035, FR-037, FR-038)
+      description:
+        "Local-first: the terminal commits every order, deduction and closed
+
+        session to local storage BEFORE any sync is attempted. The closed
+
+        session is the cash-up record of FR-035. Records then sync
+
+        individually and immediately whenever connectivity allows, and the
+
+        reconciliation sweep retries anything unsynced every 10 minutes until
+
+        the cloud confirms it.
+
+
+        Each record is all-or-nothing. A partial or corrupted record is
+
+        rejected outright rather than half-accepted, and stays queued — no
+
+        partial state ever reaches the cloud (FR-037).
+
+
+        Confirmed records come back with the server timestamp the client
+
+        writes into `synced_at`, alongside `sync_status: synced`.
+
+        "
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - records
+              properties:
+                records:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - record_type
+                      - record_id
+                      - payload
+                    properties:
+                      record_type:
+                        type: string
+                        enum:
+                          - order
+                          - shift_session
+                          - delivery
+                          - inventory_count_entry
+                      record_id:
+                        type: integer
+                      payload:
+                        type: object
+                        description: The full local row
+      responses:
+        "200":
+          description: Per-record results — confirmed or rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        record_type:
+                          type: string
+                        record_id:
+                          type: integer
+                        sync_status:
+                          type: string
+                          enum:
+                            - synced
+                            - failed
+                        synced_at:
+                          type: string
+                          format: date-time
+                          nullable: true
+                          description: Server confirmation time; null when failed
+                        error:
+                          type: string
+                          nullable: true
+                          description: Reason, e.g. corrupted or partial record
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /suppliers/{supplier_id}:
+    patch:
+      tags:
+        - Deliveries
+      summary: Edit a supplier
+      security:
+        - managerToken: []
+      parameters:
+        - name: supplier_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Supplier"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Supplier not found
+    delete:
+      tags:
+        - Deliveries
+      summary: Delete a supplier
+      security:
+        - managerToken: []
+      parameters:
+        - name: supplier_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deactivated (soft delete)
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Supplier not found
+  /managers:
+    post:
+      tags:
+        - Managers
+      summary: Create a manager account
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+                - first_name
+                - last_name
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                  description: Plaintext — hashed server-side (NFR-009)
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+      responses:
+        "201":
+          description: Manager created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Manager"
+        "400":
+          description: Missing required fields
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "409":
+          description: Username already taken
+    get:
+      tags:
+        - Managers
+      summary: List managers
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/IncludeInactive"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Manager"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /managers/{manager_id}:
+    get:
+      tags:
+        - Managers
+      summary: Get a manager by ID
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ManagerId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Manager"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Manager not found
+    patch:
+      tags:
+        - Managers
+      summary: Update a manager account
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ManagerId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                  description: Plaintext — hashed server-side
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Manager"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Manager not found
+        "409":
+          description: Username already taken
+    delete:
+      tags:
+        - Managers
+      summary: Deactivate a manager (soft delete)
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ManagerId"
+      responses:
+        "204":
+          description: Deactivated — is_active set to false
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Manager not found
+  /employees:
+    post:
+      tags:
+        - Employees
+      summary: Create a cashier employee
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - pos_id
+                - first_name
+                - last_name
+              properties:
+                pos_id:
+                  type: integer
+                  description: The POS ID the cashier uses to identify themselves at login
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+      responses:
+        "201":
+          description: Employee created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+        "400":
+          description: Missing required fields
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "409":
+          description: pos_id already taken
+    get:
+      tags:
+        - Employees
+      summary: List employees
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/IncludeInactive"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Employee"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /employees/{pos_id}:
+    get:
+      tags:
+        - Employees
+      summary: Get an employee by POS ID
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/PosId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Employee not found
+    patch:
+      tags:
+        - Employees
+      summary: Update an employee
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/PosId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Employee not found
+    delete:
+      tags:
+        - Employees
+      summary: Deactivate an employee (soft delete)
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/PosId"
+      responses:
+        "204":
+          description: Deactivated — is_active set to false
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Employee not found
+  /products:
+    post:
+      tags:
+        - Catalog
+      summary: Create a product
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - category_id
+                - name
+                - type
+                - base_price
+              properties:
+                category_id:
+                  type: integer
+                name:
+                  type: string
+                type:
+                  type: string
+                  enum:
+                    - recipe_based
+                    - reseller
+                base_price:
+                  type: number
+                  format: decimal
+                  description: LBP
+      responses:
+        "201":
+          description: Product created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          description: Invalid category_id or missing fields
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /products/{product_id}:
+    patch:
+      tags:
+        - Catalog
+      summary: Update a product
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                category_id:
+                  type: integer
+                name:
+                  type: string
+                base_price:
+                  type: number
+                  format: decimal
+                  description: LBP
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Product not found
+    delete:
+      tags:
+        - Catalog
+      summary: Deactivate a product (soft delete)
+      security:
+        - managerToken: []
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      responses:
+        "204":
+          description: Deactivated — is_active set to false
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "404":
+          description: Product not found
+components:
+  securitySchemes:
+    activeSession:
+      type: apiKey
+      in: header
+      name: X-Session-Token
+      description:
+        "Identifies the open `shift_session` on this device. Resolved against
+
+        the database on every request: the row must exist and have
+
+        `end_time = null`.
+
+
+        That is the whole check for a transaction. Not a manager credential
+
+        — the manager unlocked the terminal this morning and left; the
+
+        cashier works the rest of the day on this open session alone.
+
+
+        Dies at cash-out, when `end_time` is set. Every transaction endpoint
+
+        then returns 409 until a new session is opened, which itself
+
+        requires the PIN gate (FR-010).
+
+        "
+    panelToken:
+      type: apiKey
+      in: header
+      name: X-Panel-Token
+      description:
+        "Manager Panel open via the shared PIN (FR-010, AUTH-GATE-01).
+        Short
+
+        TTL, carries no identity. Covers everything inside the panel: cashier
+
+        login, cash-out, voids, clear, refunds. Only ever valid alongside a
+
+        live session — the PIN alone grants nothing.
+
+        "
+    managerToken:
+      type: apiKey
+      in: header
+      name: X-Manager-Token
+      description:
+        "A named manager authenticated by username and password. Required
+        for
+
+        inventory counts, deliveries, and config — the admin-PC surface.
+
+        Also a server-side session record, same rules as above.
+
+        "
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    LineItemId:
+      name: line_item_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    CategoryId:
+      name: category_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    ProductId:
+      name: product_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    ItemId:
+      name: item_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    CountId:
+      name: count_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    DeliveryId:
+      name: delivery_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    ManagerId:
+      name: manager_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    PosId:
+      name: pos_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    IncludeInactive:
+      name: include_inactive
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+      description: When true, includes deactivated records in the response
+  responses:
+    Unauthenticated:
+      description:
+        "No open cash session on this device — the token is missing, unknown,
+
+        or its session has been cashed out. Also what an unauthenticated
+
+        caller hitting the server directly receives, since they have no
+
+        session at all.
+
+        "
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    IncorrectCredentials:
+      description: Incorrect credentials
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PanelRequired:
+      description:
+        Manager Panel not open, or panel token expired — action did not
+        execute and nothing changed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ManagerRequired:
+      description: Manager username/password authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    OrderNotOpen:
+      description: Order is not open — completed orders cannot be modified
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code — see ErrorCode enum
+        message:
+          type: string
+          description: Human-readable error message
+    ShiftSession:
+      type: object
+      properties:
+        session_id:
+          type: integer
+        cashier_pos_id:
+          type: integer
+        starting_float:
+          type: number
+          format: decimal
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: null while open; set at cash-out — this IS the cash-out event
+        live_cash_total:
+          type: number
+          format: decimal
+        sync_status:
+          type: string
+          enum:
+            - pending
+            - synced
+            - failed
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+    ShiftSessionDetail:
+      allOf:
+        - $ref: "#/components/schemas/ShiftSession"
+        - type: object
+          properties:
+            cashier_first_name:
+              type: string
+              description: From the joined employee row — terminal header (FR-007)
+            cashier_last_name:
+              type: string
+            open_order:
+              type: object
+              allOf:
+                - $ref: "#/components/schemas/OrderDetail"
+              nullable: true
+              description: The recoverable basket, if one was open (FR-041)
+    ClosedSession:
+      allOf:
+        - $ref: "#/components/schemas/ShiftSession"
+        - type: object
+          properties:
+            gross_sales:
+              type: number
+              format: decimal
+              description:
+                "LBP, summed from this session's completed orders at response
+
+                time. Derived, never stored — refunds are negative orders, so
+
+                they net out of the same sum.
+
+                "
+            transaction_count:
+              type: integer
+    Category:
+      type: object
+      properties:
+        category_id:
+          type: integer
+        name:
+          type: string
+        is_active:
+          type: boolean
+    CategoryWithProducts:
+      allOf:
+        - $ref: "#/components/schemas/Category"
+        - type: object
+          properties:
+            products:
+              type: array
+              items:
+                $ref: "#/components/schemas/ProductWithSizes"
+              description: Each product includes its available sizes
+    Product:
+      type: object
+      properties:
+        product_id:
+          type: integer
+        category_id:
+          type: integer
+        name:
+          type: string
+        type:
+          type: string
+          enum:
+            - recipe_based
+            - reseller
+        base_price:
+          type: number
+          format: decimal
+          description: LBP
+        is_active:
+          type: boolean
+    ProductSizeOption:
+      type: object
+      properties:
+        modifier_id:
+          type: integer
+          nullable: true
+        modifier_name:
+          type: string
+          nullable: true
+        price_adjustment:
+          type: number
+          format: decimal
+        resolved_price:
+          type: number
+          format: decimal
+        available:
+          type: boolean
+          description: false for resellers; true for recipes (V1)
+    RecipeDetail:
+      type: object
+      description: One product+size recipe with its ingredient lines
+      properties:
+        recipe_id:
+          type: integer
+        product_id:
+          type: integer
+        product_name:
+          type: string
+        modifier_id:
+          type: integer
+          nullable: true
+          description: null for resellers, which have exactly one sizeless recipe
+        modifier_name:
+          type: string
+          nullable: true
+        ingredients:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: integer
+              item_name:
+                type: string
+              quantity:
+                type: number
+                format: decimal
+                description: Deducted per single unit sold; always 1 for resellers
+              unit:
+                type: string
+                enum:
+                  - g
+                  - ml
+                  - piece
+                description: Matches the inventory item's unit; 'piece' for resellers
+    LineItemInput:
+      type: object
+      required:
+        - product_id
+        - quantity
+      properties:
+        product_id:
+          type: integer
+        modifier_id:
+          type: integer
+          nullable: true
+          description: Required for recipe-based products; null for resellers
+        quantity:
+          type: integer
+          minimum: 1
+    Order:
+      type: object
+      properties:
+        order_id:
+          type: integer
+        session_id:
+          type: integer
+        transaction_type:
+          type: string
+          enum:
+            - sale
+            - refund
+        order_type:
+          type: string
+          enum:
+            - dine_in
+            - take_out
+          nullable: true
+          description: null on refunds — a refund is neither dine-in nor take-out
+        status:
+          type: string
+          enum:
+            - open
+            - completed
+        total_due:
+          type: number
+          format: decimal
+          description: LBP; negative on refunds
+        cash_tendered:
+          type: number
+          format: decimal
+          nullable: true
+        change_given:
+          type: number
+          format: decimal
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          description: Basket-open time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Checkout time — the receipt timestamp
+        sync_status:
+          type: string
+          enum:
+            - pending
+            - synced
+            - failed
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+        order_number:
+          type: integer
+          description: Sequential receipt number starting at 100, unique per order
+    OrderDetail:
+      allOf:
+        - $ref: "#/components/schemas/Order"
+        - type: object
+          properties:
+            line_items:
+              type: array
+              items:
+                $ref: "#/components/schemas/OrderLineItem"
+    OrderLineItem:
+      type: object
+      properties:
+        line_item_id:
+          type: integer
+        order_id:
+          type: integer
+        product_id:
+          type: integer
+        product_name:
+          type: string
+          description: Joined
+          # for_display_and_receipts: null
+        modifier_id:
+          type: integer
+          nullable: true
+        modifier_name:
+          type: string
+          nullable: true
+        quantity:
+          type: integer
+          description: Negative on refund orders
+        unit_price:
+          type: number
+          format: decimal
+          description:
+            LBP, snapshotted at add-time so later price changes never alter
+            a placed order
+        line_total:
+          type: number
+          format: decimal
+          description: unit_price × quantity
+    Receipt:
+      type: object
+      description: Exactly the fields FR-019 mandates
+      properties:
+        header:
+          type: string
+          enum:
+            - SALE
+            - REFUND
+          description:
+            From transaction_type — REFUND prints at the top for refunds
+            (FR-034)
+        order_id:
+          type: integer
+        cashier_first_name:
+          type: string
+        cashier_last_name:
+          type: string
+        cashier_pos_id:
+          type: integer
+        printed_datetime:
+          type: string
+          format: date-time
+          description: completed_at, to the minute
+        order_type:
+          type: string
+          enum:
+            - dine_in
+            - take_out
+          nullable: true
+        line_items:
+          type: array
+          items:
+            type: object
+            properties:
+              product_name:
+                type: string
+              modifier_name:
+                type: string
+                nullable: true
+              quantity:
+                type: integer
+              unit_price:
+                type: number
+                format: decimal
+              line_total:
+                type: number
+                format: decimal
+        total_due:
+          type: number
+          format: decimal
+        cash_tendered:
+          type: number
+          format: decimal
+          nullable: true
+        change_given:
+          type: number
+          format: decimal
+          nullable: true
+    DailySalesReport:
+      type: object
+      properties:
+        business_date:
+          type: string
+          format: date
+        total_revenue:
+          type: number
+          format: decimal
+        transaction_count:
+          type: integer
+          description:
+            "\n        Count of net transactions: sales minus refunds.\
+            \ Refunds count as -1\n        (they're orders with negative total_due),\
+            \ so a day with 10 sales and\n        2 refunds reports 8 net transactions.\n"
+        net_total:
+          type: number
+          format: decimal
+          description: Revenue minus refunds
+        generated_at:
+          type: string
+          format: date-time
+    InventoryItem:
+      type: object
+      properties:
+        item_id:
+          type: integer
+        name:
+          type: string
+        unit:
+          type: string
+          enum:
+            - g
+            - ml
+            - piece
+        current_stock:
+          type: number
+          format: decimal
+          description: Theoretical system stock; may be negative (FR-028)
+        count_frequency:
+          type: string
+          enum:
+            - daily
+            - monthly
+        is_negative_flag:
+          type: boolean
+        is_active:
+          type: boolean
+    PackConfiguration:
+      type: object
+      properties:
+        config_id:
+          type: integer
+        item_id:
+          type: integer
+        pack_name:
+          type: string
+          description: e.g. Box of Milk, Bag of Sugar
+        base_unit_qty:
+          type: number
+          format: decimal
+          description: Base units yielded by one of this pack
+    InventoryCountEntry:
+      type: object
+      properties:
+        count_id:
+          type: integer
+        item_id:
+          type: integer
+        item_name:
+          type: string
+        manager_id:
+          type: integer
+        physical_count:
+          type: number
+          format: decimal
+        expected_stock:
+          type: number
+          format: decimal
+          description: Read from current_stock at response time — not stored
+        variance:
+          type: number
+          format: decimal
+          description:
+            physical_count − expected_stock, signed. Computed, never stored
+            (FR-026)
+        entry_date:
+          type: string
+          format: date
+        is_locked:
+          type: boolean
+        sync_status:
+          type: string
+          enum:
+            - pending
+            - synced
+            - failed
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+    Supplier:
+      type: object
+      properties:
+        supplier_id:
+          type: integer
+        name:
+          type: string
+        is_active:
+          type: boolean
+    DeliveryDetail:
+      type: object
+      properties:
+        delivery_id:
+          type: integer
+        manager_id:
+          type: integer
+        supplier_id:
+          type: integer
+        supplier_name:
+          type: string
+        date_received:
+          type: string
+          format: date
+        notes:
+          type: string
+          nullable: true
+        sync_status:
+          type: string
+          enum:
+            - pending
+            - synced
+            - failed
+        synced_at:
+          type: string
+          format: date-time
+          nullable: true
+        line_items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: integer
+              item_name:
+                type: string
+              config_id:
+                type: integer
+              pack_name:
+                type: string
+              qty_received:
+                type: number
+                format: decimal
+                description: Count of the pack, as entered
+              base_units_added:
+                type: number
+                format: decimal
+                description:
+                  qty_received × base_unit_qty — what was committed to
+                  stock
+              cost_per_unit:
+                type: number
+                format: decimal
+                description: LBP per pack
+    ExchangeRate:
+      type: object
+      properties:
+        rate_value:
+          type: number
+          format: decimal
+          description: LBP per 1 USD
+        updated_at:
+          type: string
+          format: date-time
+    ProductWithSizes:
+      allOf:
+        - $ref: "#/components/schemas/Product"
+        - type: object
+          properties:
+            sizes:
+              type: array
+              items:
+                $ref: "#/components/schemas/ProductSizeOption"
+    ErrorCode:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - TERMINAL_LOCKED
+            - NO_SESSION
+            - SESSION_EXISTS
+            - ORDER_NOT_OPEN
+            - ORDER_COMPLETED
+            - BASKET_EMPTY
+            - INVALID_INPUT
+            - NOT_FOUND
+            - CONFLICT
+            - INSUFFICIENT_STOCK
+            - PIN_REQUIRED
+            - INVALID_CREDENTIALS
+        message:
+          type: string
+    Manager:
+      type: object
+      properties:
+        manager_id:
+          type: integer
+        username:
+          type: string
+        first_name:
+          type: string
+        last_name:
+          type: string
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+    Employee:
+      type: object
+      properties:
+        pos_id:
+          type: integer
+        first_name:
+          type: string
+        last_name:
+          type: string
+        is_active:
+          type: boolean
