@@ -311,6 +311,13 @@ paths:
         disabled, until both are provided.
 
 
+        Up to 2 sessions may be open at once (NFR-011, one per terminal) —
+
+        each gets its own `session_id`/`session_token`, fully independent of
+
+        the other. A 3rd concurrent open attempt gets 409.
+
+
         Returns the cashier''s full name for the terminal header (FR-007) and
 
         signals the client to fire the 24V drawer pulse so the float can be
@@ -368,7 +375,9 @@ paths:
             cashier_pos_id does not match any active employee — init fails
             immediately
         "409":
-          description: A session is already open on this terminal
+          description:
+            The maximum number of concurrent terminal sessions (2, NFR-011) is
+            already open
   /shift-sessions/{session_id}/cash-out:
     post:
       tags:
@@ -441,11 +450,13 @@ paths:
         didn't itself open), this is the only way back to a closed terminal.
 
 
-        Single-terminal deployment, so \"current\" is never ambiguous: there
-        is at most one session with `end_time = null` at a time, by
-        construction of `POST /shift-sessions`'s own 409 check. Same
-        behavior as the by-id route otherwise — rejected while an order is
-        still open, same `ClosedSession` response shape.
+        Only unambiguous when exactly one session is open. With up to 2
+        concurrent terminal sessions allowed (NFR-011), \"current\" no
+        longer identifies a single session once a second terminal also has
+        one open — this returns 409 rather than guessing which one to
+        close; use the by-id route instead. Same behavior as the by-id
+        route otherwise — rejected while an order is still open, same
+        `ClosedSession` response shape.
         "
       security:
         - panelToken: []
@@ -461,7 +472,7 @@ paths:
         "404":
           description: No session currently open on this terminal
         "409":
-          description: An order is still open
+          description: An order is still open, or more than one session is open (ambiguous)
   /categories:
     post:
       tags:
