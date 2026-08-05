@@ -28,3 +28,7 @@ export function isUniqueConstraintError(error: unknown, field?: string): boolean
 export function isNotFoundError(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025";
 }
+
+export function isForeignKeyConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003";
+}
