@@ -272,7 +272,7 @@ describe("proxy session+panel routes (cash-out)", () => {
   });
 
   it("returns 401 with a valid session but no panel token", async () => {
-    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1", exp: 9999999999 });
+    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1" });
     mockIsOpenSession(true);
 
     const res = await proxy(makeSessionRequest("POST", path, "valid.session.token"));
@@ -281,7 +281,7 @@ describe("proxy session+panel routes (cash-out)", () => {
   });
 
   it("returns 401 with a valid panel token but a closed session", async () => {
-    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1", exp: 9999999999 });
+    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1" });
     mockIsOpenSession(false);
     mockedVerifyPanelSecret.mockReturnValue(true);
 
@@ -291,7 +291,7 @@ describe("proxy session+panel routes (cash-out)", () => {
   });
 
   it("lets the request through and forwards x-session-id when both are valid", async () => {
-    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1", exp: 9999999999 });
+    mockedVerifySessionToken.mockReturnValue({ session_id: "session-1" });
     mockIsOpenSession(true);
     mockedVerifyPanelSecret.mockReturnValue(true);
 
@@ -299,5 +299,26 @@ describe("proxy session+panel routes (cash-out)", () => {
 
     expect(res.status).not.toBe(401);
     expect(res.headers.get("x-middleware-request-x-session-id")).toBe("session-1");
+  });
+
+  it("returns 401 for an invalid admin token, and never falls back to session/panel checks", async () => {
+    mockedVerifyAdminToken.mockReturnValue(null);
+
+    const res = await proxy(makeAdminRequest("POST", path, "bad.admin.token"));
+
+    expect(res.status).toBe(401);
+    expect(mockedVerifySessionToken).not.toHaveBeenCalled();
+    expect(mockedVerifyPanelSecret).not.toHaveBeenCalled();
+  });
+
+  it("lets a valid admin token through alone, without a session id forwarded", async () => {
+    mockedVerifyAdminToken.mockReturnValue({ role: "admin", exp: 9999999999 });
+
+    const res = await proxy(makeAdminRequest("POST", path, "valid.admin.token"));
+
+    expect(res.status).not.toBe(401);
+    expect(res.headers.get("x-middleware-request-x-session-id")).toBeNull();
+    expect(mockedVerifySessionToken).not.toHaveBeenCalled();
+    expect(mockedVerifyPanelSecret).not.toHaveBeenCalled();
   });
 });
