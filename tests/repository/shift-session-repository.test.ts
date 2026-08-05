@@ -2,7 +2,13 @@ jest.mock("@/lib/db", () => ({
   __esModule: true,
   default: {
     employee: { findUnique: jest.fn() },
-    shiftSession: { findFirst: jest.fn(), findUnique: jest.fn(), create: jest.fn(), update: jest.fn() },
+    shiftSession: {
+      count: jest.fn(),
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
     order: { findFirst: jest.fn(), aggregate: jest.fn() },
   },
 }));
@@ -14,7 +20,7 @@ import { ShiftSessionRepository } from "@/repository/shift-session-repository";
 
 const db = prisma as unknown as {
   employee: { findUnique: jest.Mock };
-  shiftSession: { findFirst: jest.Mock; findUnique: jest.Mock; create: jest.Mock; update: jest.Mock };
+  shiftSession: { count: jest.Mock; findMany: jest.Mock; findUnique: jest.Mock; create: jest.Mock; update: jest.Mock };
   order: { findFirst: jest.Mock; aggregate: jest.Mock };
 };
 
@@ -39,7 +45,7 @@ describe("ShiftSessionRepository.openSession", () => {
     await expect(repo.openSession({ cashier_pos_id: 999, starting_float: 50000 })).rejects.toThrow(
       NotFoundException,
     );
-    expect(db.shiftSession.findFirst).not.toHaveBeenCalled();
+    expect(db.shiftSession.count).not.toHaveBeenCalled();
   });
 
   it("throws NotFoundException when the employee is deactivated", async () => {
@@ -50,9 +56,18 @@ describe("ShiftSessionRepository.openSession", () => {
     );
   });
 
-  it("throws UniqueException when a session is already open", async () => {
+  it("allows opening a second session when only one terminal is currently open (NFR-011)", async () => {
     db.employee.findUnique.mockResolvedValue(employeeRow);
-    db.shiftSession.findFirst.mockResolvedValue(sessionRow);
+    db.shiftSession.count.mockResolvedValue(1);
+    db.shiftSession.create.mockResolvedValue(sessionRow);
+
+    await expect(repo.openSession({ cashier_pos_id: 1, starting_float: 50000 })).resolves.toBeDefined();
+    expect(db.shiftSession.create).toHaveBeenCalled();
+  });
+
+  it("throws UniqueException when the max concurrent terminal sessions are already open", async () => {
+    db.employee.findUnique.mockResolvedValue(employeeRow);
+    db.shiftSession.count.mockResolvedValue(2);
 
     await expect(repo.openSession({ cashier_pos_id: 1, starting_float: 50000 })).rejects.toThrow(
       UniqueException,
@@ -62,7 +77,7 @@ describe("ShiftSessionRepository.openSession", () => {
 
   it("creates the session with live_cash_total seeded from starting_float", async () => {
     db.employee.findUnique.mockResolvedValue(employeeRow);
-    db.shiftSession.findFirst.mockResolvedValue(null);
+    db.shiftSession.count.mockResolvedValue(0);
     db.shiftSession.create.mockResolvedValue(sessionRow);
 
     const result = await repo.openSession({ cashier_pos_id: 1, starting_float: 50000 });
@@ -145,14 +160,14 @@ describe("ShiftSessionRepository.cashOutCurrent", () => {
   const repo = new ShiftSessionRepository();
 
   it("throws NotFoundException when no session is open", async () => {
-    db.shiftSession.findFirst.mockResolvedValue(null);
+    db.shiftSession.findMany.mockResolvedValue([]);
 
     await expect(repo.cashOutCurrent()).rejects.toThrow(NotFoundException);
     expect(db.shiftSession.update).not.toHaveBeenCalled();
   });
 
   it("finds the open session and closes it, same as cashOut(session_id)", async () => {
-    db.shiftSession.findFirst.mockResolvedValue(sessionRow);
+    db.shiftSession.findMany.mockResolvedValue([{ session_id: "session-1" }]);
     db.shiftSession.findUnique.mockResolvedValue(sessionRow);
     db.order.findFirst.mockResolvedValue(null);
     db.order.aggregate.mockResolvedValue({ _sum: { total_due: 15000 } });
@@ -169,8 +184,15 @@ describe("ShiftSessionRepository.cashOutCurrent", () => {
     expect(result.gross_sales).toBe(15000);
   });
 
+  it("throws UniqueException when more than one session is open — 'current' is ambiguous (NFR-011)", async () => {
+    db.shiftSession.findMany.mockResolvedValue([{ session_id: "session-1" }, { session_id: "session-2" }]);
+
+    await expect(repo.cashOutCurrent()).rejects.toThrow(UniqueException);
+    expect(db.shiftSession.findUnique).not.toHaveBeenCalled();
+  });
+
   it("throws UniqueException when the open session still has an order in progress", async () => {
-    db.shiftSession.findFirst.mockResolvedValue(sessionRow);
+    db.shiftSession.findMany.mockResolvedValue([{ session_id: "session-1" }]);
     db.shiftSession.findUnique.mockResolvedValue(sessionRow);
     db.order.findFirst.mockResolvedValue({ order_id: "order-1" });
 
