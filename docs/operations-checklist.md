@@ -68,7 +68,7 @@ yet). Deliberate deviation from the contract's security block; flagged, not sile
 - [ ] `starting_float` missing, `0`, or negative → `400` (must be `> 0`)
 - [ ] `cashier_pos_id` doesn't match any employee, or matches a deactivated one → `404`
 - [ ] A session is already open (anywhere — single-terminal deployment, no per-device column to scope by) → `409`
-- [ ] Valid → `201` with the session, `session_token` (12h TTL, `X-Session-Token` from here on), `trigger_drawer_pulse: true`
+- [ ] Valid → `201` with the session, `session_token` (no TTL — valid until cash-out sets `end_time`, `X-Session-Token` from here on), `trigger_drawer_pulse: true`
 - [ ] `live_cash_total` on the created row equals `starting_float` exactly
 
 Crash recovery (FR-041, "what's my session") is handled entirely client-side from locally
@@ -76,13 +76,16 @@ persisted state — no `GET /shift-sessions/current` backend endpoint exists; it
 
 ## [shift-sessions/[session_id]/cash-out/route.ts](../src/app/api/shift-sessions/[session_id]/cash-out/route.ts) *(new)*
 
-Closes the shift (FR-004). Gated by **both** `X-Session-Token` and `X-Panel-Token` — the only
-route in the app requiring two tokens together.
+Closes the shift (FR-004). Gated by **both** `X-Session-Token` and `X-Panel-Token` together, OR by
+`X-Admin-Token` alone — an admin can close a session directly from their side without that
+device's session token (crashed terminal, lost token, etc).
 
 ### `POST`
-- [ ] No `X-Session-Token` → `401`
-- [ ] Valid session, no `X-Panel-Token` → `401`
+- [ ] No `X-Session-Token` and no `X-Admin-Token` → `401`
+- [ ] Valid session, no `X-Panel-Token`, no `X-Admin-Token` → `401`
 - [ ] Both present but the session token's embedded `session_id` doesn't match the `{session_id}` in the URL → `401` — confirm this is checked in the route itself (a stale/foreign session token can't be used to close a different session by editing the URL)
+- [ ] Invalid `X-Admin-Token` → `401`, and never falls back to checking `X-Session-Token`/`X-Panel-Token`
+- [ ] Valid `X-Admin-Token`, no session/panel token at all → `200` — proxy never sets `x-session-id` on this path, so the route's match check is skipped (no header to match)
 - [ ] Session already closed → `409`
 - [ ] An order on this session still has `status: open` → `409` (finish or clear the basket first)
 - [ ] Valid → `200`, `end_time` set, `gross_sales` computed from this session's **completed** orders at response time (never stored) — refunds are negative-total orders, so they net out of the same sum automatically
@@ -841,8 +844,8 @@ there's no token to sign, just a static secret to hand back on success.
 
 ### `openSession`
 - [ ] Calls `ShiftSessionRepository.openSession` with the input data unchanged
-- [ ] Signs a session token via `signSessionToken(session.session_id, 12 * 60 * 60)`
-- [ ] Response is the session spread with `session_token`, `expires_at`, and `trigger_drawer_pulse: true` added
+- [ ] Signs a session token via `signSessionToken(session.session_id)` — no TTL/`exp` claim
+- [ ] Response is the session spread with `session_token` and `trigger_drawer_pulse: true` added — no `expires_at` (not part of the contract for this endpoint; the token is valid until cash-out, not until a deadline)
 
 ### `cashOut` / `cashOutCurrent` *(new)*
 - [ ] Each a pure passthrough to `ShiftSessionRepository`
