@@ -63,6 +63,25 @@ describe("OrderSyncRecordSchema", () => {
     const result = OrderSyncRecordSchema.safeParse(rest);
     expect(result.success).toBe(false);
   });
+
+  it("accepts change_given that correctly equals cash_tendered - total_due", () => {
+    const result = OrderSyncRecordSchema.safeParse({
+      ...validRecord,
+      cash_tendered: 5500,
+      change_given: 500,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("allows cash_tendered/change_given to both be absent (non-cash payment)", () => {
+    const result = OrderSyncRecordSchema.safeParse(validRecord);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not require change_given when cash_tendered is present but the tender is exact", () => {
+    const result = OrderSyncRecordSchema.safeParse({ ...validRecord, cash_tendered: 5000 });
+    expect(result.success).toBe(true);
+  });
 });
 
 describe("SyncRecordsRequestSchema", () => {

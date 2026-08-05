@@ -30,4 +30,14 @@ describe("ManagerLoginSchema", () => {
     const result = ManagerLoginSchema.safeParse({ username: "jdoe", password: "weak" });
     expect(result.success).toBe(true);
   });
+
+  it("rejects a username containing HTML/SQL injection metacharacters", () => {
+    const result = ManagerLoginSchema.safeParse({ username: "jdoe<script>", password: "Hunter2!" });
+    expect(result.success).toBe(false);
+  });
+
+  it("does not restrict the password character set — it's hashed, never rendered or queried", () => {
+    const result = ManagerLoginSchema.safeParse({ username: "jdoe", password: "p@ss'\"<>;word" });
+    expect(result.success).toBe(true);
+  });
 });
