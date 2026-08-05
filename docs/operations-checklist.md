@@ -766,23 +766,36 @@ DB call, no auth — deliberately just "did the request make it here."
 
 ## [sync-repository.ts](../src/repository/sync-repository.ts) *(new)*
 
-One `order.create` per record — plain insert, no upsert, no separate pre-validation queries. Sync
-is one-time: an order is written client-side (IndexedDB), synced once, and never edited afterward,
-so there's no update path to support here at all. An invalid `session_id`/`product_id`/
-`modifier_id`, or a resend of an `order_id` that's already synced, is caught the same way any
-other write failure is: the FK/PK constraint rejects the `create`, the `catch` maps it to
-`"failed"`. Deliberately not pre-checked/batched, to keep this a plain per-record loop.
+One `order.create` per record inside its own `$transaction`, alongside the recipe-lookup/
+stock-decrement work for each line item — plain insert, no upsert. Sync is one-time: an order is
+written client-side (IndexedDB), synced once, and never edited afterward, so there's no update
+path to support here at all.
+
+`syncOne`'s `catch` only converts a fixed set of **expected** data conflicts into a per-record
+`"failed"` result — everything else rethrows, so a DB outage/Prisma misconfig surfaces as a `500`
+instead of silently reporting every record as failed with no trace of why. The expected set
+(`isExpectedSyncFailure`), each mapped from a distinguishable error type:
+- FK violation (P2003) — unknown `session_id`, or a line item's `product_id`/`modifier_id`
+- Unique violation on `order_id` (P2002) — a resend of an `order_id` that's already synced
+- `RecipeNotFoundException` — a line item's product/modifier has no seeded recipe
+- `SessionClosedException` — the session exists but `end_time` is already set (checked explicitly
+  before the `order.create`, since the FK only proves the session exists, not that it's still
+  open — a session can close via the admin-by-id cash-out override without this terminal's
+  involvement at all, while a record was still queued offline)
 
 ### `syncOrderRecords`
-- [ ] Batch is processed via `Promise.all` over each record's independent `syncOne` call, not a sequential `for` loop *(fixed — was awaiting one record at a time, so total latency scaled linearly with batch size)*
+- [ ] Batch is processed via a bounded worker pool (`MAX_CONCURRENT_SYNCS = 5`), not unbounded `Promise.all` — confirm no more than 5 `syncOne` calls are in flight at once for a large batch
 - [ ] Results array is length N, **same order as the input**, regardless of which record's DB call actually resolves first
-- [ ] Valid record → `order.create` called once with `line_items: { create: [...] }` nested (single Prisma call, no `$transaction` needed — Prisma nests the write itself)
-- [ ] Unknown `session_id`, or a line item's `product_id`/`modifier_id` not in the DB → `order.create` throws (FK constraint), caught, that record's result is `{ sync_status: "failed", synced_at: null }` — nothing persisted
-- [ ] Re-synced `order_id` (already exists) → `create` throws (PK unique constraint), same `"failed"` result — confirm this does **not** update the existing row in any way
-- [ ] One record's `create` throws, others succeed → only that record comes back `"failed"`; the rest are `"synced"` — confirm each record is its own try/catch, not a shared transaction for the whole batch
+- [ ] Valid record → `shiftSession.findUnique` confirms the session is open, then `order.create` is called with `line_items: { create: [...] }` nested, then stock is decremented per recipe ingredient — all inside one `$transaction`
+- [ ] Unknown `session_id`, or a line item's `product_id`/`modifier_id` not in the DB → FK violation, caught, that record's result is `{ sync_status: "failed", synced_at: null }` — nothing persisted (transaction rolls back)
+- [ ] `session_id` resolves to a session with `end_time` already set → `SessionClosedException` thrown **before** `order.create` is even called, same `"failed"` result
+- [ ] Re-synced `order_id` (already exists) → unique constraint violation, same `"failed"` result — confirm this does **not** update the existing row in any way
+- [ ] A line item's product/modifier has no seeded recipe → `RecipeNotFoundException`, same `"failed"` result, transaction rolls back any stock decrements already applied for earlier line items in that order
+- [ ] An unexpected error (not one of the four above) → rethrown, not swallowed — confirm the batch promise rejects rather than returning a `"failed"` result, and the route surfaces it as `500`
+- [ ] One record's create throws an expected error, others succeed → only that record comes back `"failed"`; the rest are `"synced"` — confirm each record is its own try/catch, not a shared transaction for the whole batch
 - [ ] Omitted optional fields (`transaction_type`, `order_type`, `status`, `cash_tendered`, `change_given`, `completed_at`) → defaulted (`"sale"`, `null`, `"completed"`, `null`, `null`, `null`) before being sent to Prisma
 - [ ] `line_items: []` on the record → nested `create: []` — no line items, no error
-- [ ] Success → returned `synced_at` is a fresh `Date`, matching the value persisted as `sync_status: "synced"`
+- [ ] Success → returned `synced_at` is `getCurrentBusinessDateTime()` (business-local, not `new Date()` — it's written into a `timestamp without time zone` column), matching the value persisted as `sync_status: "synced"`
 - [ ] A batch of N records with a mix of outcomes → results array is length N, same order as the input, each with its own correct `order_id`
 
 ---

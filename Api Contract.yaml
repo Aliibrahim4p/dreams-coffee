@@ -400,10 +400,22 @@ paths:
 
         first.
 
+
+        Also reachable with `adminToken` alone, in place of
+
+        `activeSession`+`panelToken` — an admin closing this session directly
+
+        from their side, without needing this specific device's
+
+        `X-Session-Token` at all. For when the POS terminal itself can't be
+
+        used to cash out (crashed, lost its token, etc).
+
         "
       security:
         - activeSession: []
           panelToken: []
+        - adminToken: []
       parameters:
         - $ref: "#/components/parameters/SessionId"
       responses:
@@ -1927,9 +1939,13 @@ paths:
 
         edit-after-submit path. Each record is independent: one bad record
 
-        (unknown session_id, unknown product_id/modifier_id, or a resend of
+        (unknown session_id, unknown product_id/modifier_id, a resend of an
 
-        an order_id that's already synced) fails on its own without
+        order_id that's already synced, or a session_id that's since been
+
+        cashed out — including by the admin-by-id cash-out override, which
+
+        doesn't go through this terminal at all) fails on its own without
 
         affecting the rest of the batch, and nothing partial is written for
 
@@ -2563,6 +2579,13 @@ components:
         combined on a single route. Otherwise any manager could edit or
 
         deactivate any other manager's account.
+
+
+        Also accepted as an alternative to `activeSession`+`panelToken` on
+
+        `POST /shift-sessions/{session_id}/cash-out`, so an admin can close a
+
+        session directly without that device's `X-Session-Token`.
         "
   parameters:
     SessionId:
