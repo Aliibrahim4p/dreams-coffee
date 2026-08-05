@@ -7,6 +7,7 @@ import { isUniqueConstraintError } from "@/lib/prisma-errors";
 import { getCurrentBusinessDate, getCountEntryLockDeadline } from "@/lib/business-date";
 import { ManagerRepository } from "@/repository/manager-repository";
 import { InventoryCountEntryCreate, InventoryCountEntryUpdate } from "@/types/inventory-count-entry";
+import logger from "@/util/logger";
 
 type EntryWithItem = {
   count_id: string;
@@ -83,6 +84,7 @@ export class InventoryCountEntryRepository {
           race.count_id,
         );
       }
+      logger.error("Failed to create count entry item_id=%d: %s", data.item_id, error);
       throw error;
     }
   }
@@ -99,12 +101,17 @@ export class InventoryCountEntryRepository {
       );
     }
 
-    const updated = await prisma.inventoryCountEntry.update({
-      where: { count_id: countId },
-      data: { physical_count: data.physical_count },
-      include: { item: true },
-    });
-    return mapEntry(updated);
+    try {
+      const updated = await prisma.inventoryCountEntry.update({
+        where: { count_id: countId },
+        data: { physical_count: data.physical_count },
+        include: { item: true },
+      });
+      return mapEntry(updated);
+    } catch (error) {
+      logger.error("Failed to update count entry count_id=%s: %s", countId, error);
+      throw error;
+    }
   }
 
   async listEntries(entryDate?: Date, itemId?: number) {

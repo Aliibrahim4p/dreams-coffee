@@ -4,6 +4,7 @@ import UniqueException from "@/exceptions/unique-exception";
 import NotFoundException from "@/exceptions/not-found-exception";
 import { isUniqueConstraintError } from "@/lib/prisma-errors";
 import { InventoryItemCreate } from "@/types/inventory-item";
+import logger from "@/util/logger";
 
 function mapInventoryItem(item: {
   item_id: number;
@@ -48,6 +49,7 @@ export class InventoryItemRepository {
       if (isUniqueConstraintError(error, "name")) {
         throw new UniqueException("Item name already exists");
       }
+      logger.error("Failed to create inventory item name=%s: %s", data.name, error);
       throw error;
     }
   }

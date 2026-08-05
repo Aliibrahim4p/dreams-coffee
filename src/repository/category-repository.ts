@@ -4,6 +4,7 @@ import prisma from "@/lib/db";
 import { isNotFoundError, isUniqueConstraintError } from "@/lib/prisma-errors";
 import { mapProduct, resolveProductSizes } from "@/repository/product-repository";
 import { Category, CategoryUpdate } from "@/types/category";
+import logger from "@/util/logger";
 
 function mapCategory(category: { category_id: number; name: string; is_active: boolean }) {
   return {
@@ -26,6 +27,7 @@ export class CategoryRepository {
       if (isUniqueConstraintError(error, "name")) {
         throw new UniqueException("Category name must be unique");
       }
+      logger.error("Failed to create category name=%s: %s", data.name, error);
       throw error;
     }
   }
@@ -76,6 +78,7 @@ export class CategoryRepository {
       if (isUniqueConstraintError(error, "name")) {
         throw new UniqueException("Category name already taken");
       }
+      logger.error("Failed to update category_id=%d: %s", categoryId, error);
       throw error;
     }
   }
@@ -90,6 +93,7 @@ export class CategoryRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Category not found");
       }
+      logger.error("Failed to deactivate category_id=%d: %s", categoryId, error);
       throw error;
     }
   }
