@@ -8,15 +8,22 @@ function businessTimezone(): string {
 
 /** Calendar date (Y-M-D) of `instant` in the business timezone, as a UTC-midnight Date for @db.Date columns. */
 function toBusinessDate(instant: Date): Date {
-  const parts = new Intl.DateTimeFormat("en-CA", {
+  const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: businessTimezone(),
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   }).formatToParts(instant);
 
-  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return new Date(Date.UTC(Number(lookup.year), Number(lookup.month) - 1, Number(lookup.day)));
+  const lookup = Object.fromEntries(
+    parts.map((part) => [part.type, part.value]),
+  );
+  return new Date(
+    Date.UTC(Number(lookup.year), Number(lookup.month) - 1, Number(lookup.day)),
+  );
 }
 
 /** Today's calendar date in the configured timezone (BUSINESS_TIMEZONE env var, defaults to Asia/Beirut), as a UTC-midnight Date for @db.Date columns. */
@@ -36,9 +43,24 @@ function businessTimezoneOffsetMinutes(instant: Date): number {
     timeZoneName: "shortOffset",
   }).formatToParts(instant);
 
-  const offsetName = parts.find((part) => part.type === "timeZoneName")?.value ?? "GMT+0";
+  const offsetName =
+    parts.find((part) => part.type === "timeZoneName")?.value ?? "GMT+0";
   const match = offsetName.match(/GMT([+-]\d+)/);
   return match ? Number(match[1]) * 60 : 0;
+}
+
+/**
+ * Current instant, shifted so its UTC fields read as business-timezone wall-clock
+ * time (handles DST via businessTimezoneOffsetMinutes) — for full DateTime columns
+ * (e.g. synced_at) stored as `timestamp without time zone`, which persist whatever
+ * calendar digits they're given with no zone conversion of their own. Not a true UTC
+ * instant: don't use this for elapsed-time math, only for storing/displaying local time.
+ * getCurrentBusinessDate is the date-only (midnight) counterpart for @db.Date columns.
+ */
+export function getCurrentBusinessDateTime(): Date {
+  const now = new Date();
+  const offsetMinutes = businessTimezoneOffsetMinutes(now);
+  return new Date(now.getTime() + offsetMinutes * 60 * 1000);
 }
 
 /**
