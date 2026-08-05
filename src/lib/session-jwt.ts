@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "crypto";
 
-export type SessionTokenPayload = { session_id: string; exp: number };
+export type SessionTokenPayload = { session_id: string };
 
 function getSecret(): string {
   const secret = process.env.SESSION_JWT_SECRET;
@@ -18,15 +18,16 @@ function sign(headerAndPayload: string): string {
   return createHmac("sha256", getSecret()).update(headerAndPayload).digest("base64url");
 }
 
-export function signSessionToken(
-  sessionId: string,
-  expiresInSeconds: number,
-): { token: string; expiresAt: Date } {
+/**
+ * No exp claim: per the contract, X-Session-Token is valid until cash-out sets
+ * end_time — the proxy's live isOpenSession check is the whole expiry check,
+ * not a TTL on the token itself (a shift can run longer than any fixed TTL).
+ */
+export function signSessionToken(sessionId: string): { token: string } {
   const header = encode({ alg: "HS256", typ: "JWT" });
-  const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
-  const payload = encode({ session_id: sessionId, exp });
+  const payload = encode({ session_id: sessionId });
   const signature = sign(`${header}.${payload}`);
-  return { token: `${header}.${payload}.${signature}`, expiresAt: new Date(exp * 1000) };
+  return { token: `${header}.${payload}.${signature}` };
 }
 
 export function verifySessionToken(token: string): SessionTokenPayload | null {
@@ -48,10 +49,7 @@ export function verifySessionToken(token: string): SessionTokenPayload | null {
     return null;
   }
 
-  if (typeof parsed.session_id !== "string" || typeof parsed.exp !== "number") {
-    return null;
-  }
-  if (parsed.exp < Math.floor(Date.now() / 1000)) {
+  if (typeof parsed.session_id !== "string") {
     return null;
   }
 
