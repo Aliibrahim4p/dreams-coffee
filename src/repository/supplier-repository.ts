@@ -2,6 +2,7 @@ import prisma from "@/lib/db";
 import NotFoundException from "@/exceptions/not-found-exception";
 import { isNotFoundError } from "@/lib/prisma-errors";
 import { SupplierCreate, SupplierUpdate } from "@/types/supplier";
+import logger from "@/util/logger";
 
 function mapSupplier(supplier: { supplier_id: number; name: string; is_active: boolean }) {
   return {
@@ -13,8 +14,13 @@ function mapSupplier(supplier: { supplier_id: number; name: string; is_active: b
 
 export class SupplierRepository {
   async createSupplier(data: SupplierCreate) {
-    const supplier = await prisma.supplier.create({ data: { name: data.name } });
-    return mapSupplier(supplier);
+    try {
+      const supplier = await prisma.supplier.create({ data: { name: data.name } });
+      return mapSupplier(supplier);
+    } catch (error) {
+      logger.error("Failed to create supplier name=%s: %s", data.name, error);
+      throw error;
+    }
   }
 
   async listSuppliers(includeInactive?: boolean) {
@@ -35,6 +41,7 @@ export class SupplierRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Supplier not found");
       }
+      logger.error("Failed to update supplier_id=%d: %s", supplierId, error);
       throw error;
     }
   }
@@ -49,6 +56,7 @@ export class SupplierRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Supplier not found");
       }
+      logger.error("Failed to deactivate supplier_id=%d: %s", supplierId, error);
       throw error;
     }
   }

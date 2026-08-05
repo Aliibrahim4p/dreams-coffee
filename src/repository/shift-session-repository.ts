@@ -1,8 +1,10 @@
 import prisma from "@/lib/db";
 import { Prisma } from "@/app/generated/prisma/client";
+import { getCurrentBusinessDateTime } from "@/lib/business-date";
 import NotFoundException from "@/exceptions/not-found-exception";
 import UniqueException from "@/exceptions/unique-exception";
 import { OpenShiftSession } from "@/types/shift-session";
+import logger from "@/util/logger";
 
 type SessionWithCashier = {
   session_id: string;
@@ -41,17 +43,22 @@ export class ShiftSessionRepository {
       throw new UniqueException("A session is already open on this terminal");
     }
 
-    const session = await prisma.shiftSession.create({
-      data: {
-        cashier_pos_id: data.cashier_pos_id,
-        starting_float: data.starting_float,
-        start_time: new Date(),
-        // the float that was just put in the drawer is the starting live cash total
-        live_cash_total: data.starting_float,
-      },
-      include: { cashier: true },
-    });
-    return mapSession(session);
+    try {
+      const session = await prisma.shiftSession.create({
+        data: {
+          cashier_pos_id: data.cashier_pos_id,
+          starting_float: data.starting_float,
+          start_time: getCurrentBusinessDateTime(),
+          // the float that was just put in the drawer is the starting live cash total
+          live_cash_total: data.starting_float,
+        },
+        include: { cashier: true },
+      });
+      return mapSession(session);
+    } catch (error) {
+      logger.error("Failed to open shift session cashier_pos_id=%d: %s", data.cashier_pos_id, error);
+      throw error;
+    }
   }
 
   async cashOut(sessionId: string) {
@@ -68,23 +75,28 @@ export class ShiftSessionRepository {
       throw new UniqueException("An order is still open — finish or clear the basket first");
     }
 
-    const grossSales = await prisma.order.aggregate({
-      where: { session_id: sessionId, status: "completed" },
-      _sum: { total_due: true },
-    });
+    try {
+      const grossSales = await prisma.order.aggregate({
+        where: { session_id: sessionId, status: "completed" },
+        _sum: { total_due: true },
+      });
 
-    const closed = await prisma.shiftSession.update({
-      where: { session_id: sessionId },
-      data: { end_time: new Date() },
-      include: { cashier: true },
-    });
+      const closed = await prisma.shiftSession.update({
+        where: { session_id: sessionId },
+        data: { end_time: getCurrentBusinessDateTime() },
+        include: { cashier: true },
+      });
 
-    return {
-      ...mapSession(closed),
-      // computed from completed orders at response time, never stored — refunds are
-      // negative orders, so they net out of the same sum
-      gross_sales: Number(grossSales._sum.total_due ?? 0),
-    };
+      return {
+        ...mapSession(closed),
+        // computed from completed orders at response time, never stored — refunds are
+        // negative orders, so they net out of the same sum
+        gross_sales: Number(grossSales._sum.total_due ?? 0),
+      };
+    } catch (error) {
+      logger.error("Failed to cash out session_id=%s: %s", sessionId, error);
+      throw error;
+    }
   }
 
   /**

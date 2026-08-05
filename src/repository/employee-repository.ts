@@ -3,6 +3,7 @@ import UniqueException from "@/exceptions/unique-exception";
 import NotFoundException from "@/exceptions/not-found-exception";
 import { isNotFoundError, isUniqueConstraintError } from "@/lib/prisma-errors";
 import { EmployeeCreate, EmployeeUpdate } from "@/types/employee";
+import logger from "@/util/logger";
 
 function mapEmployee(employee: { pos_id: number; first_name: string; last_name: string; is_active: boolean }) {
   return {
@@ -22,6 +23,7 @@ export class EmployeeRepository {
       if (isUniqueConstraintError(error, "pos_id")) {
         throw new UniqueException("pos_id already taken");
       }
+      logger.error("Failed to create employee pos_id=%d: %s", data.pos_id, error);
       throw error;
     }
   }
@@ -49,6 +51,7 @@ export class EmployeeRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Employee not found");
       }
+      logger.error("Failed to update employee pos_id=%d: %s", posId, error);
       throw error;
     }
   }
@@ -60,6 +63,7 @@ export class EmployeeRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Employee not found");
       }
+      logger.error("Failed to deactivate employee pos_id=%d: %s", posId, error);
       throw error;
     }
   }

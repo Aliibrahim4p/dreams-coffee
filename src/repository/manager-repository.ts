@@ -1,9 +1,11 @@
 import prisma from "@/lib/db";
+import { getCurrentBusinessDateTime } from "@/lib/business-date";
 import { hashPassword } from "@/lib/password";
 import UniqueException from "@/exceptions/unique-exception";
 import NotFoundException from "@/exceptions/not-found-exception";
 import { isNotFoundError, isUniqueConstraintError } from "@/lib/prisma-errors";
 import { ManagerCreate, ManagerUpdate } from "@/types/manager";
+import logger from "@/util/logger";
 
 function mapManager(manager: {
   manager_id: number;
@@ -33,7 +35,7 @@ export class ManagerRepository {
           password_hash,
           first_name: data.first_name,
           last_name: data.last_name,
-          created_at: new Date(),
+          created_at: getCurrentBusinessDateTime(),
         },
       });
       return mapManager(manager);
@@ -41,6 +43,7 @@ export class ManagerRepository {
       if (isUniqueConstraintError(error, "username")) {
         throw new UniqueException("Username already taken");
       }
+      logger.error("Failed to create manager username=%s: %s", data.username, error);
       throw error;
     }
   }
@@ -96,6 +99,7 @@ export class ManagerRepository {
       if (isUniqueConstraintError(error, "username")) {
         throw new UniqueException("Username already taken");
       }
+      logger.error("Failed to update manager_id=%d: %s", managerId, error);
       throw error;
     }
   }
@@ -110,6 +114,7 @@ export class ManagerRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Manager not found");
       }
+      logger.error("Failed to deactivate manager_id=%d: %s", managerId, error);
       throw error;
     }
   }
