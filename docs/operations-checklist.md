@@ -950,13 +950,23 @@ Each schema's "operations" are its field-level validation rules. Test each rule 
 ### `ManagerLoginSchema`
 - [ ] `username` empty → rejected
 - [ ] `password` empty → rejected
+- [ ] `username` containing `< > ; ' " ` ` (HTML/SQL metacharacters) → rejected (NFR-008 — login is the only pre-auth free-text surface, so this is the allow-list boundary)
+- [ ] `username` over 100 chars → rejected
+- [ ] `password` containing any of those same characters → **accepted** — password is scrypt-hashed and compared, never interpolated into a query or rendered, so restricting its charset would only shrink entropy without closing a real injection surface; only a 200-char max applies
 - [ ] Both present, **any** non-empty password (policy NOT enforced here, unlike create) → accepted by the schema (auth outcome is a separate concern, see service section)
 
-## [panel-pin.ts](../src/types/panel-pin.ts) *(new)*
+## [admin-login.ts](../src/types/admin-login.ts)
+### `AdminLoginSchema`
+- [ ] `admin_key` empty or missing → rejected
+- [ ] `admin_key` containing `< > ; ' " ` ` → rejected (NFR-008)
+- [ ] `admin_key` over 200 chars → rejected
+
+## [panel-pin.ts](../src/types/panel-pin.ts)
 ### `PanelPinVerifySchema`
-- [ ] `pin` empty → rejected
-- [ ] `pin` missing → rejected
-- [ ] Any non-empty `pin` → accepted (PIN *correctness* is a service-layer concern, not schema)
+- [ ] `pin` empty or missing → rejected
+- [ ] `pin` containing any non-digit character (including injection metacharacters — digits-only is a stricter allow-list than NFR-008 requires elsewhere) → rejected
+- [ ] `pin` over 12 digits → rejected
+- [ ] Any digits-only `pin` within length → accepted by the schema (PIN *correctness* is a service-layer concern)
 
 ## [shift-session.ts](../src/types/shift-session.ts) *(new)*
 ### `OpenShiftSessionSchema`
