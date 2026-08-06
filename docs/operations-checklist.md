@@ -67,7 +67,8 @@ yet). Deliberate deviation from the contract's security block; flagged, not sile
 - [ ] `cashier_pos_id` non-integer → `400`
 - [ ] `starting_float` missing, `0`, or negative → `400` (must be `> 0`)
 - [ ] `cashier_pos_id` doesn't match any employee, or matches a deactivated one → `404`
-- [ ] A session is already open (anywhere — single-terminal deployment, no per-device column to scope by) → `409`
+- [ ] Fewer than 2 sessions currently open → `201`, a 2nd concurrent session is allowed (NFR-011, one per terminal) — confirm `shiftSession.count`, not `findFirst`, backs this check
+- [ ] 2 sessions already open (max concurrent terminals, no per-device column to scope by beyond a headcount) → `409`
 - [ ] Valid → `201` with the session, `session_token` (no TTL — valid until cash-out sets `end_time`, `X-Session-Token` from here on), `trigger_drawer_pulse: true`
 - [ ] `live_cash_total` on the created row equals `starting_float` exactly
 
@@ -96,13 +97,16 @@ device's session token (crashed terminal, lost token, etc).
 Recovery path: closes whatever session is currently open **without** needing its `session_token` —
 for a device that lost its stored token (or, day one, the session `seed.ts` deliberately leaves
 open for demo orders to reference). Gated by `X-Panel-Token` **only**, unlike the by-id cash-out
-route above. Single-terminal deployment, so "current" is never ambiguous — there is at most one
-open session at a time by construction (`openSession`'s own 409 check guarantees this).
+route above. Only unambiguous when exactly one session is open — up to 2 concurrent terminal
+sessions are now allowed (NFR-011), so a second terminal's open session makes "current" ambiguous;
+the repository refuses (409) rather than guessing.
 
 ### `POST`
 - [ ] No `X-Panel-Token` → `401`
 - [ ] No `X-Session-Token` required at all — confirm the proxy never checks one for this route, unlike `[session_id]/cash-out`
 - [ ] No session currently open → `404`
+- [ ] Exactly one session open → proceeds normally
+- [ ] More than one session open (both terminals active) → `409`, `shiftSession.findUnique`/`update` never called — confirm `cashOutCurrent` uses `findMany` with `take: 3` (`MAX_CONCURRENT_TERMINAL_SESSIONS + 1`), not `findFirst`, so it can detect ">1" without guessing which one to pick
 - [ ] An order on the open session still has `status: open` → `409`
 - [ ] Valid → `200`, same response shape as the by-id cash-out (`end_time` set, `gross_sales` computed)
 - [ ] The route pattern for `[session_id]/cash-out` explicitly excludes the literal segment `current` (`proxy.ts`'s `SESSION_AND_PANEL_ROUTES` regex has a negative lookahead) — confirm the two routes never both match the same request
@@ -648,20 +652,22 @@ DB call, no auth — deliberately just "did the request make it here."
 ### `openSession`
 - [ ] `cashier_pos_id` doesn't match any employee → `NotFoundException`
 - [ ] `cashier_pos_id` matches a **deactivated** employee → same `NotFoundException`
-- [ ] Any session already open (`end_time: null`), regardless of which employee — `UniqueException`, `shiftSession.create` never called
-- [ ] Success → `live_cash_total` seeded from `starting_float`, `start_time` is `new Date()`, response includes `cashier_name` resolved from the joined employee
+- [ ] Fewer than `MAX_CONCURRENT_TERMINAL_SESSIONS` (2, NFR-011) sessions open (`shiftSession.count({end_time: null})`) → proceeds, `shiftSession.create` called
+- [ ] Already 2 sessions open, regardless of which employees — `UniqueException`, `shiftSession.create` never called
+- [ ] Success → `live_cash_total` seeded from `starting_float`, `start_time` is `getCurrentBusinessDateTime()` (business-local, not `new Date()` — written into a `timestamp without time zone` column), response includes `cashier_name` resolved from the joined employee
 
 ### `cashOut`
 - [ ] `session_id` doesn't exist → `NotFoundException`
 - [ ] Already closed → `UniqueException`
 - [ ] An order on this session has `status: "open"` → `UniqueException`, `shiftSession.update` never called
-- [ ] Success → `end_time` set to `new Date()`, `gross_sales` = `SUM(total_due)` over this session's `status: "completed"` orders (via `order.aggregate`), computed fresh each call, never persisted
+- [ ] Success → `end_time` set to `getCurrentBusinessDateTime()` (business-local, not `new Date()`), `gross_sales` = `SUM(total_due)` over this session's `status: "completed"` orders (via `order.aggregate`), computed fresh each call, never persisted
 - [ ] No completed orders → `_sum.total_due` is `null` from Prisma → mapped to `gross_sales: 0`, not `NaN`/`null`
 - [ ] A refund (`transaction_type: "refund"`, negative `total_due`) among the completed orders → subtracts from `gross_sales` correctly, no special-casing needed since it's the same `SUM`
 
-### `cashOutCurrent` *(new — recovery path, no session_token needed)*
-- [ ] No session currently open (`shiftSession.findFirst({end_time: null})` → `null`) → `NotFoundException`, `cashOut` never called
-- [ ] Open session found → delegates straight to `cashOut(session.session_id)`, same behavior/checks as calling it directly (order-still-open guard, `gross_sales`, etc.)
+### `cashOutCurrent` *(recovery path, no session_token needed)*
+- [ ] No session currently open (`shiftSession.findMany({end_time: null}, take: 3)` → `[]`) → `NotFoundException`, `cashOut` never called
+- [ ] Exactly one session open → delegates straight to `cashOut(session.session_id)`, same behavior/checks as calling it directly (order-still-open guard, `gross_sales`, etc.)
+- [ ] More than one session open (both terminals active, NFR-011) → `UniqueException` — "current" can't disambiguate between them, `shiftSession.findUnique`/`update` never called; caller must use the by-id route
 
 ### `isOpenSession`
 - [ ] Unknown `session_id` → `false` (doesn't throw) — mirrors `ManagerRepository.isActiveManager`
