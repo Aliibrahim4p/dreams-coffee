@@ -3,27 +3,22 @@ import { signManagerToken } from "@/lib/jwt";
 
 describe("signSessionToken / verifySessionToken", () => {
   it("round-trips a valid token", () => {
-    const { token, expiresAt } = signSessionToken("session-1", 3600);
-
-    expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
+    const { token } = signSessionToken("session-1");
 
     const payload = verifySessionToken(token);
-    expect(payload).toEqual({ session_id: "session-1", exp: expect.any(Number) });
+    expect(payload).toEqual({ session_id: "session-1" });
   });
 
   it("returns null for a tampered payload", () => {
-    const { token } = signSessionToken("session-1", 3600);
+    const { token } = signSessionToken("session-1");
     const [header, , signature] = token.split(".");
-    const exp = Math.floor(Date.now() / 1000) + 3600;
-    const tamperedPayload = Buffer.from(JSON.stringify({ session_id: "session-2", exp })).toString(
-      "base64url",
-    );
+    const tamperedPayload = Buffer.from(JSON.stringify({ session_id: "session-2" })).toString("base64url");
 
     expect(verifySessionToken(`${header}.${tamperedPayload}.${signature}`)).toBeNull();
   });
 
   it("returns null for a token signed with a different secret", () => {
-    const { token } = signSessionToken("session-1", 3600);
+    const { token } = signSessionToken("session-1");
     const originalSecret = process.env.SESSION_JWT_SECRET;
     process.env.SESSION_JWT_SECRET = "a-different-secret";
 
@@ -32,10 +27,12 @@ describe("signSessionToken / verifySessionToken", () => {
     process.env.SESSION_JWT_SECRET = originalSecret;
   });
 
-  it("returns null for an expired token", () => {
-    const { token } = signSessionToken("session-1", -10);
+  it("never expires — stays valid regardless of how much time has passed", () => {
+    const { token } = signSessionToken("session-1");
 
-    expect(verifySessionToken(token)).toBeNull();
+    const payload = verifySessionToken(token);
+    expect(payload).toEqual({ session_id: "session-1" });
+    expect(payload).not.toHaveProperty("exp");
   });
 
   it("returns null for a malformed token", () => {

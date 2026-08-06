@@ -33,7 +33,6 @@ describe("POST /api/shift-sessions", () => {
       end_time: null,
       live_cash_total: 50000,
       session_token: "signed.session.token",
-      expires_at: new Date(),
       trigger_drawer_pulse: true,
     });
 
