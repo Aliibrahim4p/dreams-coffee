@@ -35,6 +35,75 @@ login structurally, but there's no DB row/username: the "identity" is just posse
 - [ ] `admin_token` is signed with `ADMIN_JWT_SECRET` — a **different** secret from `MANAGER_JWT_SECRET` — confirm a manager token is never accepted as an admin token and vice versa
 - [ ] This path is under `/api/auth/`, always public per `proxy.ts` — confirm it works with zero other auth headers present
 
+## [auth/manager/pin/verify/route.ts](../src/app/api/auth/manager/pin/verify/route.ts) *(new)*
+
+The Manager Panel PIN gate (FR-010, AUTH-GATE-01). Checks a submitted PIN against `app_config`'s
+`manager_pin` (hashed, same scrypt scheme as manager passwords) and, on success, hands back
+`PANEL_SECRET_KEY` itself as `panel_token` — a static shared secret, not a signed/expiring token.
+Deliberately simple: same trust level as the PIN (gate-only, no identity), and the FE is expected
+to hold onto it (encrypted, on its own side) to gate local void/refund actions that never reach
+this backend at all — there's nothing here for a TTL or single-use tracking to protect.
+
+### `POST`
+- [x] Public, same as `/api/auth/manager/login` and `/api/auth/admin/login` — **fixed**: this used to be gated by `X-Session-Token` (`activeSession`), which deadlocked the whole app (this endpoint is the *only* way to get a `panel_token`, and opening the first shift session of the day requires a `panel_token` — requiring an existing session to reach it meant there was never a way to open the very first session, or any session after a cash-out). The PIN check itself is the security boundary, same as the admin shared-secret login.
+- [ ] Malformed JSON → `400`
+- [ ] `pin` empty/missing → `400`
+- [ ] `manager_pin` never configured in `app_config` → `401 "Incorrect PIN"` (same message as a wrong PIN — doesn't leak whether it's configured)
+- [ ] Wrong PIN → `401 "Incorrect PIN"`
+- [ ] Correct PIN → `200` with `panel_token` equal to `PANEL_SECRET_KEY` exactly — no `expires_at`, nothing to expire
+- [ ] `X-Panel-Token` on other panel-gated routes is checked via constant-time comparison against the same `PANEL_SECRET_KEY` (`verifyPanelSecret`) — confirm a manager/admin/session token is never accepted in its place
+
+## [shift-sessions/route.ts](../src/app/api/shift-sessions/route.ts) *(new)*
+
+Opens a cashier's shift (FR-002, FR-003, FR-007). Gated by `X-Panel-Token` **only** — the contract
+also lists `activeSession` here, but that can't be a literal requirement for the endpoint that
+creates the terminal's very first session of the day (there's nothing to hold a session token for
+yet). Deliberate deviation from the contract's security block; flagged, not silent.
+
+### `POST`
+- [ ] No `X-Panel-Token` → `401` (route handler never reached — `ShiftSessionService.openSession` not called)
+- [ ] A valid `X-Manager-Token` alone does not substitute for the panel token
+- [ ] Malformed JSON → `400`
+- [ ] `cashier_pos_id` non-integer → `400`
+- [ ] `starting_float` missing, `0`, or negative → `400` (must be `> 0`)
+- [ ] `cashier_pos_id` doesn't match any employee, or matches a deactivated one → `404`
+- [ ] A session is already open (anywhere — single-terminal deployment, no per-device column to scope by) → `409`
+- [ ] Valid → `201` with the session, `session_token` (12h TTL, `X-Session-Token` from here on), `trigger_drawer_pulse: true`
+- [ ] `live_cash_total` on the created row equals `starting_float` exactly
+
+Crash recovery (FR-041, "what's my session") is handled entirely client-side from locally
+persisted state — no `GET /shift-sessions/current` backend endpoint exists; it isn't needed.
+
+## [shift-sessions/[session_id]/cash-out/route.ts](../src/app/api/shift-sessions/[session_id]/cash-out/route.ts) *(new)*
+
+Closes the shift (FR-004). Gated by **both** `X-Session-Token` and `X-Panel-Token` — the only
+route in the app requiring two tokens together.
+
+### `POST`
+- [ ] No `X-Session-Token` → `401`
+- [ ] Valid session, no `X-Panel-Token` → `401`
+- [ ] Both present but the session token's embedded `session_id` doesn't match the `{session_id}` in the URL → `401` — confirm this is checked in the route itself (a stale/foreign session token can't be used to close a different session by editing the URL)
+- [ ] Session already closed → `409`
+- [ ] An order on this session still has `status: open` → `409` (finish or clear the basket first)
+- [ ] Valid → `200`, `end_time` set, `gross_sales` computed from this session's **completed** orders at response time (never stored) — refunds are negative-total orders, so they net out of the same sum automatically
+- [ ] No completed orders at all → `gross_sales: 0`, not `null`/error
+
+## [shift-sessions/current/cash-out/route.ts](../src/app/api/shift-sessions/current/cash-out/route.ts) *(new)*
+
+Recovery path: closes whatever session is currently open **without** needing its `session_token` —
+for a device that lost its stored token (or, day one, the session `seed.ts` deliberately leaves
+open for demo orders to reference). Gated by `X-Panel-Token` **only**, unlike the by-id cash-out
+route above. Single-terminal deployment, so "current" is never ambiguous — there is at most one
+open session at a time by construction (`openSession`'s own 409 check guarantees this).
+
+### `POST`
+- [ ] No `X-Panel-Token` → `401`
+- [ ] No `X-Session-Token` required at all — confirm the proxy never checks one for this route, unlike `[session_id]/cash-out`
+- [ ] No session currently open → `404`
+- [ ] An order on the open session still has `status: open` → `409`
+- [ ] Valid → `200`, same response shape as the by-id cash-out (`end_time` set, `gross_sales` computed)
+- [ ] The route pattern for `[session_id]/cash-out` explicitly excludes the literal segment `current` (`proxy.ts`'s `SESSION_AND_PANEL_ROUTES` regex has a negative lookahead) — confirm the two routes never both match the same request
+
 ## [categories/route.ts](../src/app/api/categories/route.ts)
 
 ### `POST`
@@ -565,6 +634,37 @@ DB call, no auth — deliberately just "did the request make it here."
 ### `deactivateManager`
 - [ ] Not found → `NotFoundException`
 
+## [panel-repository.ts](../src/repository/panel-repository.ts) *(new)*
+
+### `getManagerPinHash`
+- [ ] `manager_pin` never configured → `null` (no throw)
+- [ ] Configured → the raw stored hash
+
+## [shift-session-repository.ts](../src/repository/shift-session-repository.ts) *(new)*
+
+### `openSession`
+- [ ] `cashier_pos_id` doesn't match any employee → `NotFoundException`
+- [ ] `cashier_pos_id` matches a **deactivated** employee → same `NotFoundException`
+- [ ] Any session already open (`end_time: null`), regardless of which employee — `UniqueException`, `shiftSession.create` never called
+- [ ] Success → `live_cash_total` seeded from `starting_float`, `start_time` is `new Date()`, response includes `cashier_name` resolved from the joined employee
+
+### `cashOut`
+- [ ] `session_id` doesn't exist → `NotFoundException`
+- [ ] Already closed → `UniqueException`
+- [ ] An order on this session has `status: "open"` → `UniqueException`, `shiftSession.update` never called
+- [ ] Success → `end_time` set to `new Date()`, `gross_sales` = `SUM(total_due)` over this session's `status: "completed"` orders (via `order.aggregate`), computed fresh each call, never persisted
+- [ ] No completed orders → `_sum.total_due` is `null` from Prisma → mapped to `gross_sales: 0`, not `NaN`/`null`
+- [ ] A refund (`transaction_type: "refund"`, negative `total_due`) among the completed orders → subtracts from `gross_sales` correctly, no special-casing needed since it's the same `SUM`
+
+### `cashOutCurrent` *(new — recovery path, no session_token needed)*
+- [ ] No session currently open (`shiftSession.findFirst({end_time: null})` → `null`) → `NotFoundException`, `cashOut` never called
+- [ ] Open session found → delegates straight to `cashOut(session.session_id)`, same behavior/checks as calling it directly (order-still-open guard, `gross_sales`, etc.)
+
+### `isOpenSession`
+- [ ] Unknown `session_id` → `false` (doesn't throw) — mirrors `ManagerRepository.isActiveManager`
+- [ ] Open session → `true`
+- [ ] Closed session → `false`
+
 ## [supplier-repository.ts](../src/repository/supplier-repository.ts)
 
 `is_active` is a non-nullable `Boolean @default(true)` column (migration `supplier_is_active_not_null` backfilled old `NULL` rows to `true`) — no more null-handling in this file.
@@ -725,6 +825,28 @@ Not a thin passthrough — has real branching logic. Verify directly:
 - [ ] `manager` object in the response excludes `password_hash`
 - [ ] Timing: compare response latency for an unknown-username request vs. a valid-username-wrong-password request — the former skips `scrypt` entirely, the latter doesn't; confirm the gap is measurable if you're evaluating this as a real risk
 
+## [panel-auth-service.ts](../src/services/panel-auth-service.ts) *(new)*
+
+Not a thin passthrough — same shape as `manager-auth-service.ts`/`admin-auth-service.ts`, but simpler:
+there's no token to sign, just a static secret to hand back on success.
+
+### `verifyPin`
+- [ ] `manager_pin` never configured → `UnauthorizedException "Incorrect PIN"`, `verifyPassword`/`issuePanelToken` never called
+- [ ] Configured, wrong PIN → same exception/message, `issuePanelToken` never called
+- [ ] Correct PIN → `{ panel_token }` where `panel_token === PANEL_SECRET_KEY` — no `expires_at` field at all
+
+## [shift-session-service.ts](../src/services/shift-session-service.ts) *(new)*
+
+`openSession` is not a pure passthrough — it also signs the session token. `cashOut`/`cashOutCurrent` are.
+
+### `openSession`
+- [ ] Calls `ShiftSessionRepository.openSession` with the input data unchanged
+- [ ] Signs a session token via `signSessionToken(session.session_id, 12 * 60 * 60)`
+- [ ] Response is the session spread with `session_token`, `expires_at`, and `trigger_drawer_pulse: true` added
+
+### `cashOut` / `cashOutCurrent` *(new)*
+- [ ] Each a pure passthrough to `ShiftSessionRepository`
+
 ## [supplier-service.ts](../src/services/supplier-service.ts)
 - [ ] `createSupplier`, `listSuppliers`, `updateSupplier`, `deactivateSupplier` — each a pure passthrough
 
@@ -813,6 +935,21 @@ Each schema's "operations" are its field-level validation rules. Test each rule 
 - [ ] `username` empty → rejected
 - [ ] `password` empty → rejected
 - [ ] Both present, **any** non-empty password (policy NOT enforced here, unlike create) → accepted by the schema (auth outcome is a separate concern, see service section)
+
+## [panel-pin.ts](../src/types/panel-pin.ts) *(new)*
+### `PanelPinVerifySchema`
+- [ ] `pin` empty → rejected
+- [ ] `pin` missing → rejected
+- [ ] Any non-empty `pin` → accepted (PIN *correctness* is a service-layer concern, not schema)
+
+## [shift-session.ts](../src/types/shift-session.ts) *(new)*
+### `OpenShiftSessionSchema`
+- [ ] `cashier_pos_id` non-integer → rejected
+- [ ] `cashier_pos_id` missing → rejected
+- [ ] `starting_float` missing → rejected
+- [ ] `starting_float = 0` → rejected (positive, not nonnegative)
+- [ ] `starting_float` negative → rejected
+- [ ] Fully valid payload → accepted
 
 ## [supplier.ts](../src/types/supplier.ts)
 ### `SupplierCreateSchema` / `SupplierUpdateSchema`

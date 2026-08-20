@@ -75,10 +75,11 @@ async function main() {
   });
 
   // ---------- App config ----------
+  // Manager PIN for manual testing: 1234
   await prisma.appConfig.create({
     data: {
       config_key: "manager_pin",
-      config_value: "$2b$10$examplehashedpin",
+      config_value: await hashPassword("1234"),
     },
   });
   await prisma.appConfig.create({
@@ -543,7 +544,13 @@ async function main() {
     },
   });
 
-  // Open shift (John, today) with an in-progress open order
+  // Open shift (John, today) — the session itself is deliberately left open (end_time:
+  // null) for manual testing of the shift-session endpoints (cash-out, etc.), but its
+  // order is completed rather than left open: there's no API to complete/clear an
+  // existing order (the `/orders` resource isn't built yet), so a genuinely open order
+  // here would permanently block cashing this session out via the real API. The
+  // "order still open" cash-out rejection is already covered by
+  // shift-session-repository.test.ts with mocked data.
   const openSession = await prisma.shiftSession.create({
     data: {
       cashier_pos_id: john.pos_id,
@@ -564,12 +571,12 @@ async function main() {
       session_id: openSession.session_id,
       transaction_type: "sale",
       order_type: "dine_in",
-      status: "open",
+      status: "completed",
       total_due: espressoMediumPrice + latteLargePrice,
-      cash_tendered: null,
-      change_given: null,
+      cash_tendered: 300000,
+      change_given: 300000 - (espressoMediumPrice + latteLargePrice),
       created_at: new Date("2026-07-28T09:00:00Z"),
-      completed_at: null,
+      completed_at: new Date("2026-07-28T09:04:00Z"),
       sync_status: "pending",
       synced_at: null,
       line_items: {
