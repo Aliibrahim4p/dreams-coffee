@@ -1939,9 +1939,13 @@ paths:
 
         edit-after-submit path. Each record is independent: one bad record
 
-        (unknown session_id, unknown product_id/modifier_id, or a resend of
+        (unknown session_id, unknown product_id/modifier_id, a resend of an
 
-        an order_id that's already synced) fails on its own without
+        order_id that's already synced, or a session_id that's since been
+
+        cashed out — including by the admin-by-id cash-out override, which
+
+        doesn't go through this terminal at all) fails on its own without
 
         affecting the rest of the batch, and nothing partial is written for
 
