@@ -16,6 +16,9 @@ type SessionWithCashier = {
   cashier: { first_name: string; last_name: string };
 };
 
+// NFR-011: exactly 2 concurrent terminals, each with its own session_id/session_token.
+const MAX_CONCURRENT_TERMINAL_SESSIONS = 2;
+
 function mapSession(session: SessionWithCashier) {
   return {
     session_id: session.session_id,
@@ -35,12 +38,12 @@ export class ShiftSessionRepository {
       throw new NotFoundException("cashier_pos_id does not match any active employee");
     }
 
-    // Single-terminal deployment: "a session already open on this terminal" (the contract's
-    // 409 case) means any session anywhere with end_time still null — there's no per-device
-    // column to scope this by.
-    const openSession = await prisma.shiftSession.findFirst({ where: { end_time: null } });
-    if (openSession) {
-      throw new UniqueException("A session is already open on this terminal");
+    // Up to MAX_CONCURRENT_TERMINAL_SESSIONS may be open at once — one per terminal
+    // (NFR-011). There's no per-device column to scope this by, so it's a headcount
+    // of open sessions system-wide, not an identity check against a specific terminal.
+    const openSessionCount = await prisma.shiftSession.count({ where: { end_time: null } });
+    if (openSessionCount >= MAX_CONCURRENT_TERMINAL_SESSIONS) {
+      throw new UniqueException("Maximum number of concurrent terminal sessions already open");
     }
 
     try {
@@ -101,16 +104,24 @@ export class ShiftSessionRepository {
 
   /**
    * Recovery path: cash out whatever session is currently open, without needing its
-   * session_token — for when a device's stored token is lost, or (single-terminal
-   * deployment) there's simply no ambiguity about which session "current" means.
-   * Panel-token-gated only; see proxy.ts.
+   * session_token — for when a device's stored token is lost. Only unambiguous when
+   * exactly one session is open; with a second terminal's session also open (NFR-011),
+   * "current" no longer identifies a single session, so this refuses rather than
+   * guessing — use the by-id cash-out route instead. Panel-token-gated; see proxy.ts.
    */
   async cashOutCurrent() {
-    const openSession = await prisma.shiftSession.findFirst({ where: { end_time: null } });
-    if (!openSession) {
+    const openSessions = await prisma.shiftSession.findMany({
+      where: { end_time: null },
+      take: MAX_CONCURRENT_TERMINAL_SESSIONS + 1,
+      select: { session_id: true },
+    });
+    if (openSessions.length === 0) {
       throw new NotFoundException("No open session on this terminal");
     }
-    return this.cashOut(openSession.session_id);
+    if (openSessions.length > 1) {
+      throw new UniqueException("Multiple sessions are open — use the by-id cash-out route instead");
+    }
+    return this.cashOut(openSessions[0].session_id);
   }
 
   async isOpenSession(sessionId: string): Promise<boolean> {

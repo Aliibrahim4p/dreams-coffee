@@ -55,7 +55,9 @@ const ADMIN_ROUTES: Array<{ method: string; pattern: RegExp }> = [
  * Also covers the recovery cash-out (POST /shift-sessions/current/cash-out): a
  * panel-token holder closing whatever session is currently open without needing
  * its session_token — for a device that lost its stored token, or just clearing
- * seeded/stuck state. Single-terminal deployment, so "current" is unambiguous.
+ * seeded/stuck state. Only unambiguous when exactly one session is open — with a
+ * second terminal's session also open (NFR-011), the repository itself refuses
+ * rather than guessing which one "current" means; see cashOutCurrent.
  */
 const PANEL_ROUTES: Array<{ method: string; pattern: RegExp }> = [
   { method: "POST", pattern: /^\/api\/shift-sessions$/ },
