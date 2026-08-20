@@ -6,6 +6,7 @@ import UniqueException from "@/exceptions/unique-exception";
 import { isNotFoundError, isUniqueConstraintError } from "@/lib/prisma-errors";
 import { ProductCreate, ProductUpdate } from "@/types/product";
 import { RecipeCreate, RecipeUpdate } from "@/types/recipe";
+import logger from "@/util/logger";
 
 export type ProductSizeOption = {
   modifier_id: number | null;
@@ -93,8 +94,13 @@ export class ProductRepository {
     if (!category) {
       throw new BadRequestException("Invalid category_id");
     }
-    const product = await prisma.product.create({ data });
-    return mapProduct(product);
+    try {
+      const product = await prisma.product.create({ data });
+      return mapProduct(product);
+    } catch (error) {
+      logger.error("Failed to create product name=%s: %s", data.name, error);
+      throw error;
+    }
   }
 
   async updateProduct(productId: number, data: ProductUpdate) {
@@ -116,6 +122,7 @@ export class ProductRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Product not found");
       }
+      logger.error("Failed to update product_id=%d: %s", productId, error);
       throw error;
     }
   }
@@ -130,6 +137,7 @@ export class ProductRepository {
       if (isNotFoundError(error)) {
         throw new NotFoundException("Product not found");
       }
+      logger.error("Failed to deactivate product_id=%d: %s", productId, error);
       throw error;
     }
   }
@@ -233,6 +241,7 @@ export class ProductRepository {
         // @@unique([product_id, modifier_id])
         throw new UniqueException("A recipe already exists for this product and size");
       }
+      logger.error("Failed to create recipe for product_id=%d: %s", productId, error);
       throw error;
     }
   }
@@ -301,6 +310,7 @@ export class ProductRepository {
       if (isUniqueConstraintError(error)) {
         throw new UniqueException("A recipe already exists for this product and size");
       }
+      logger.error("Failed to update recipe_id=%d for product_id=%d: %s", recipeId, productId, error);
       throw error;
     }
   }
