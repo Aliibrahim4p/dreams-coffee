@@ -101,7 +101,7 @@ model InventoryItem {
 model Supplier {
   supplier_id Int        @id @default(autoincrement())
   name        String
-  is_active   Boolean?
+  is_active   Boolean    @default(true)
   deliveries  Delivery[]
 
   @@map("supplier")

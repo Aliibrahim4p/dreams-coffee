@@ -1,5 +1,6 @@
 import { PrismaClient } from "@/app/generated/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { hashPassword } from "@/lib/password";
 
 const prisma = new PrismaClient({
   adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }),
@@ -29,10 +30,11 @@ async function main() {
   await prisma.employee.deleteMany();
 
   // ---------- Managers ----------
+  // Login credentials for manual testing: admin / Admin123! and rghosn / Shift123!
   const admin = await prisma.manager.create({
     data: {
       username: "admin",
-      password_hash: "admin",
+      password_hash: await hashPassword("Admin123!"),
       first_name: "Admin",
       last_name: "User",
       created_at: today,
@@ -41,7 +43,7 @@ async function main() {
   const shiftManager = await prisma.manager.create({
     data: {
       username: "rghosn",
-      password_hash: "$2b$10$examplehashedpassword1",
+      password_hash: await hashPassword("Shift123!"),
       first_name: "Rania",
       last_name: "Ghosn",
       created_at: yesterday,
@@ -193,8 +195,8 @@ async function main() {
   const inactiveSupplier = await prisma.supplier.create({
     data: { name: "Old Roasters Inc", is_active: false },
   });
-  const unknownStatusSupplier = await prisma.supplier.create({
-    data: { name: "Metro Dairy", is_active: null },
+  const metroDairySupplier = await prisma.supplier.create({
+    data: { name: "Metro Dairy", is_active: true },
   });
 
   // ---------- Pack configurations ----------
@@ -352,7 +354,7 @@ async function main() {
   await prisma.delivery.create({
     data: {
       manager_id: shiftManager.manager_id,
-      supplier_id: unknownStatusSupplier.supplier_id,
+      supplier_id: metroDairySupplier.supplier_id,
       date_received: yesterday,
       notes: "2 bags damaged in transit",
       sync_status: "pending",
