@@ -66,6 +66,12 @@ const PANEL_ROUTES: Array<{ method: string; pattern: RegExp }> = [
  * activeSession + panelToken together: closing a session that's already open —
  * by its own session_token, not the "current" recovery path above (excluded here
  * so the two routes can't both match the same request).
+ *
+ * Also accepts a valid X-Admin-Token on its own instead — an admin closing a
+ * session directly by id, without going through the POS terminal at all. This
+ * covers the case where the terminal itself can't be used to cash out (crashed,
+ * lost its session token, etc): the admin can still close the session from
+ * their side rather than being stuck waiting on the POS.
  */
 const SESSION_AND_PANEL_ROUTES: Array<{ method: string; pattern: RegExp }> = [
   { method: "POST", pattern: /^\/api\/shift-sessions\/(?!current\/)[^/]+\/cash-out$/ },
@@ -102,7 +108,7 @@ function unauthorized(method: string, pathname: string, message: string) {
   return NextResponse.json({ error: message }, { status: 401 });
 }
 
-/** Verifies X-Session-Token: signature/expiry, then a live end_time=null check — same shape as the manager token's live is_active check. */
+/** Verifies X-Session-Token's signature, then a live end_time=null check — no TTL on the token itself, same shape as the manager token's live is_active check. */
 async function resolveSessionId(request: NextRequest): Promise<string | null> {
   const token = request.headers.get(SESSION_TOKEN_HEADER);
   if (!token) return null;
@@ -137,6 +143,14 @@ export async function proxy(request: NextRequest) {
   }
 
   if (matchesSessionAndPanelRoute(method, pathname)) {
+    const adminToken = request.headers.get(ADMIN_TOKEN_HEADER);
+    if (adminToken) {
+      if (!verifyAdminToken(adminToken)) {
+        return unauthorized(method, pathname, "Admin authentication required");
+      }
+      return NextResponse.next();
+    }
+
     const sessionId = await resolveSessionId(request);
     if (!sessionId) {
       return unauthorized(method, pathname, "Active session required");

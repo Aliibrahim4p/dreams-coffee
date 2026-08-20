@@ -40,18 +40,29 @@ describe("POST /api/shift-sessions/[session_id]/cash-out", () => {
     expect(MockedService.cashOut).toHaveBeenCalledWith("session-1");
   });
 
-  it("returns 401 when the x-session-id header is missing (proxy bypassed)", async () => {
-    const res = await POST(makeRequest(null), makeParams("session-1"));
-
-    expect(res.status).toBe(401);
-    expect(MockedService.cashOut).not.toHaveBeenCalled();
-  });
-
   it("returns 401 when the session token's session_id does not match the path", async () => {
     const res = await POST(makeRequest("session-2"), makeParams("session-1"));
 
     expect(res.status).toBe(401);
     expect(MockedService.cashOut).not.toHaveBeenCalled();
+  });
+
+  it("cashes out with no session-id match check when x-session-id is absent (admin-authorized request)", async () => {
+    MockedService.cashOut.mockResolvedValue({
+      session_id: "session-1",
+      cashier_pos_id: 1,
+      cashier_name: "John Doe",
+      starting_float: 50000,
+      start_time: new Date(),
+      end_time: new Date(),
+      live_cash_total: 50000,
+      gross_sales: 42000,
+    });
+
+    const res = await POST(makeRequest(null), makeParams("session-1"));
+
+    expect(res.status).toBe(200);
+    expect(MockedService.cashOut).toHaveBeenCalledWith("session-1");
   });
 
   it("returns 409 when the session is already closed or an order is still open", async () => {
