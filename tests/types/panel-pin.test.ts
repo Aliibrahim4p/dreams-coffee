@@ -12,4 +12,12 @@ describe("PanelPinVerifySchema", () => {
   it("rejects a missing pin", () => {
     expect(PanelPinVerifySchema.safeParse({}).success).toBe(false);
   });
+
+  it("rejects a non-digit pin", () => {
+    expect(PanelPinVerifySchema.safeParse({ pin: "12a4" }).success).toBe(false);
+  });
+
+  it("rejects a pin containing injection metacharacters", () => {
+    expect(PanelPinVerifySchema.safeParse({ pin: "1234'; --" }).success).toBe(false);
+  });
 });
