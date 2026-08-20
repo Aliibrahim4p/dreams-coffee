@@ -1,4 +1,5 @@
 import { ExchangeRateRepository } from "@/repository/exchange-rate-repository";
+import logger from "@/util/logger";
 
 export class ExchangeRateService {
   static async getExchangeRate() {
@@ -6,6 +7,8 @@ export class ExchangeRateService {
   }
 
   static async updateExchangeRate(rateValue: number) {
-    return new ExchangeRateRepository().updateExchangeRate(rateValue);
+    const rate = await new ExchangeRateRepository().updateExchangeRate(rateValue);
+    logger.info("Exchange rate updated: %d", rateValue);
+    return rate;
   }
 }

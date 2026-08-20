@@ -1,9 +1,12 @@
 import { ManagerRepository } from "@/repository/manager-repository";
 import { ManagerCreate, ManagerUpdate } from "@/types/manager";
+import logger from "@/util/logger";
 
 export class ManagerService {
   static async createManager(data: ManagerCreate) {
-    return new ManagerRepository().createManager(data);
+    const manager = await new ManagerRepository().createManager(data);
+    logger.info("Manager created: manager_id=%d username=%s", manager.manager_id, manager.username);
+    return manager;
   }
 
   static async listManagers(includeInactive: boolean) {
@@ -15,10 +18,13 @@ export class ManagerService {
   }
 
   static async updateManager(managerId: number, data: ManagerUpdate) {
-    return new ManagerRepository().updateManager(managerId, data);
+    const manager = await new ManagerRepository().updateManager(managerId, data);
+    logger.info("Manager updated: manager_id=%d", managerId);
+    return manager;
   }
 
   static async deactivateManager(managerId: number): Promise<void> {
-    return new ManagerRepository().deactivateManager(managerId);
+    await new ManagerRepository().deactivateManager(managerId);
+    logger.info("Manager deactivated: manager_id=%d", managerId);
   }
 }

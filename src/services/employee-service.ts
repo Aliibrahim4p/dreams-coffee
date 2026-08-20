@@ -1,9 +1,12 @@
 import { EmployeeRepository } from "@/repository/employee-repository";
 import { EmployeeCreate, EmployeeUpdate } from "@/types/employee";
+import logger from "@/util/logger";
 
 export class EmployeeService {
   static async createEmployee(data: EmployeeCreate) {
-    return new EmployeeRepository().createEmployee(data);
+    const employee = await new EmployeeRepository().createEmployee(data);
+    logger.info("Employee created: pos_id=%d", employee.pos_id);
+    return employee;
   }
 
   static async listEmployees(includeInactive: boolean) {
@@ -15,10 +18,13 @@ export class EmployeeService {
   }
 
   static async updateEmployee(posId: number, data: EmployeeUpdate) {
-    return new EmployeeRepository().updateEmployee(posId, data);
+    const employee = await new EmployeeRepository().updateEmployee(posId, data);
+    logger.info("Employee updated: pos_id=%d", posId);
+    return employee;
   }
 
   static async deactivateEmployee(posId: number): Promise<void> {
-    return new EmployeeRepository().deactivateEmployee(posId);
+    await new EmployeeRepository().deactivateEmployee(posId);
+    logger.info("Employee deactivated: pos_id=%d", posId);
   }
 }
