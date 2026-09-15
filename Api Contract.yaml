@@ -2754,16 +2754,6 @@ components:
         live_cash_total:
           type: number
           format: decimal
-        sync_status:
-          type: string
-          enum:
-            - pending
-            - synced
-            - failed
-        synced_at:
-          type: string
-          format: date-time
-          nullable: true
     ShiftSessionDetail:
       allOf:
         - $ref: "#/components/schemas/ShiftSession"
@@ -3157,16 +3147,6 @@ components:
           format: date
         is_locked:
           type: boolean
-        sync_status:
-          type: string
-          enum:
-            - pending
-            - synced
-            - failed
-        synced_at:
-          type: string
-          format: date-time
-          nullable: true
     Supplier:
       type: object
       properties:
@@ -3193,16 +3173,6 @@ components:
           format: date
         notes:
           type: string
-          nullable: true
-        sync_status:
-          type: string
-          enum:
-            - pending
-            - synced
-            - failed
-        synced_at:
-          type: string
-          format: date-time
           nullable: true
         line_items:
           type: array
