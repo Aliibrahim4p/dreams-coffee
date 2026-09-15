@@ -127,9 +127,6 @@ model ShiftSession {
   end_time        DateTime?
   /// LBP
   live_cash_total Decimal
-  sync_status     SyncStatus @default(pending)
-  /// timestamp of successful sync; null until synced (FR-035)
-  synced_at       DateTime?
   orders          Order[]
   cashier         Employee   @relation(fields: [cashier_pos_id], references: [pos_id])
 
@@ -171,9 +168,6 @@ model Delivery {
   date_received DateTime           @db.Date
   /// optional; e.g. discrepancies, partial shipments, damaged goods
   notes         String?
-  sync_status   SyncStatus         @default(pending)
-  /// timestamp of successful sync; null until synced (FR-035)
-  synced_at     DateTime?
   manager       Manager            @relation(fields: [manager_id], references: [manager_id])
   supplier      Supplier           @relation(fields: [supplier_id], references: [supplier_id])
   line_items    DeliveryLineItem[]
@@ -207,9 +201,6 @@ model InventoryCountEntry {
   entry_date     DateTime      @db.Date
   /// editable same-day; locked once date changes (FR-027)
   is_locked      Boolean       @default(false)
-  sync_status    SyncStatus    @default(pending)
-  /// timestamp of successful sync; null until synced (FR-035)
-  synced_at      DateTime?
   item           InventoryItem @relation(fields: [item_id], references: [item_id])
   manager        Manager       @relation(fields: [manager_id], references: [manager_id])
 

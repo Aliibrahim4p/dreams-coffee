@@ -16,8 +16,6 @@ type EntryWithItem = {
   physical_count: Prisma.Decimal;
   entry_date: Date;
   is_locked: boolean;
-  sync_status: string;
-  synced_at: Date | null;
   item: { name: string; current_stock: Prisma.Decimal };
 };
 
@@ -34,8 +32,6 @@ function mapEntry(entry: EntryWithItem) {
     variance: physicalCount - expectedStock,
     entry_date: entry.entry_date,
     is_locked: new Date() >= getCountEntryLockDeadline(entry.entry_date),
-    sync_status: entry.sync_status,
-    synced_at: entry.synced_at,
   };
 }
 
