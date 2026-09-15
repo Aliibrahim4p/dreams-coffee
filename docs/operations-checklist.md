@@ -5,8 +5,6 @@ one sub-heading per operation (exported HTTP handler / class method / schema). I
 operation, one checkbox per case. Check a box only after you've actually run that case, not
 read the code.
 
-Not committed — local working notes only.
-
 ---
 
 # `src/app/api/**/route.ts` (routes / controllers)
