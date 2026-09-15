@@ -84,6 +84,8 @@ pushes finished orders to `POST /api/sync/records` once connectivity allows — 
    - `MANAGER_JWT_SECRET`, `ADMIN_JWT_SECRET`, `SESSION_JWT_SECRET` — HMAC signing secrets
    - `ADMIN_SECRET_KEY` — shared admin login secret
    - `PANEL_SECRET_KEY` — shared Manager Panel token (handed back verbatim on correct PIN)
+   - `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` — Cloudflare R2
+     credentials backing the offline-sync staging area (see `POST /api/sync/staging`)
 2. Install dependencies and apply migrations:
    ```bash
    npm install

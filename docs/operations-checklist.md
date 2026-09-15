@@ -471,6 +471,123 @@ connection to its own endpoint.
 - [ ] Response shape is `{ results: [{ order_id, sync_status, synced_at }] }` and nothing else per the spec — no extra fields, no error messages
 - [ ] Confirm `synced_at` in a `"synced"` result is a real timestamp (not the client's `created_at`/`completed_at`)
 
+## [sync/staging/route.ts](../src/app/api/sync/staging/route.ts) *(new — R2-staged offline sync)*
+
+A durable landing zone in front of `/sync/records`, backed by Cloudflare R2: every order is
+written to its own R2 object (`staging/{order_id}.json`) before anything is attempted against
+Postgres, so a failed sync leaves the order recoverable instead of lost. Deliberately does **no**
+business validation — the input shape here is flatter than `/sync/records`'s too: line items are
+just `product_id`/`modifier_id`/`unit_price` per unit (no `quantity` or `total_due` from the
+client — the terminal computes its own total client-side, entirely offline, from a locally cached
+price list; `unit_price` is carried through so processing can both use it and cross-check it, not
+so the terminal can skip sending it). Price *validation*, quantity aggregation, cash
+reconciliation, and the actual sync all happen later, in `sync/staging/process/route.ts` — this
+route's only job is "get it durably saved," so it can only fail on a genuine storage outage, never
+on the data itself.
+
+### `POST`
+- [ ] No `X-Manager-Token` → `401` (default proxy fallback, same branch as `/sync/records`)
+- [ ] Malformed JSON → `400`
+- [ ] `records: []` → `400` (min 1)
+- [ ] A record's `line_items: []` → `400` (min 1)
+- [ ] A line item missing `unit_price` → `400`
+- [ ] `status: "completed"` without `completed_at` → `400`
+- [ ] `order_type` set to anything other than `"dine_in"`/`"take_out"`/`null`/omitted (a garbage
+      string) → `400` — the enum itself is structural, checked here
+- [ ] `order_type` missing/`null` on a `"sale"` record, or set on a `"refund"` record → **accepted**
+      here regardless of `transaction_type` — that cross-field rule is a business check, not a shape
+      check, so it's deferred to `sync/staging/process/route.ts` (`INVALID_ORDER_TYPE`) rather than
+      blocking the record from being durably staged at all
+- [ ] Valid batch → `200 { results: [{ order_id, staged: true, key }] }`, `key` is
+      `staging/<order_id>.json`
+- [ ] Re-staging the same `order_id` overwrites its own object rather than creating a duplicate
+- [ ] A batch with a mix of orders → every order staged independently; nothing about one order
+      affects another's result
+- [ ] R2 unreachable/misconfigured credentials → that order's result is
+      `{ staged: false, code: "STAGING_STORAGE_UNAVAILABLE", message }`, other orders in the same
+      batch unaffected
+
+## [sync/staging/process/route.ts](../src/app/api/sync/staging/process/route.ts) *(new — R2-staged offline sync)*
+
+Where all the real work happens: scans everything currently under R2's `staging/` prefix and, for
+each staged order not already in Postgres, checks that its `session_id` references a currently
+**open** shift session (`ShiftSessionRepository.isOpenSession` — the same check `proxy.ts` uses to
+gate session-bearing requests), resolves each line item's *current* catalog price
+(`product.base_price + size_modifier.price_adjustment`) and compares it against the `unit_price`
+the terminal sent for that line item — any disagreement means the terminal's offline price cache
+is stale (or something's wrong), and the order is failed rather than trusted blindly. Only once
+the session checks out and every line item's price checks out does it aggregate repeated
+`(product_id, modifier_id)` entries into `quantity`, compute `total_due` (negated for
+`transaction_type: "refund"`) from the now-verified catalog prices. `cash_tendered`/
+`change_given` default to `total_due`/`0` for whichever one the client didn't send (not stored
+as `null` the way `/sync/records` does — see below), then get checked as
+`cash_tendered - change_given === total_due` (sales only — see below), and replay it through the
+same `SyncService.syncOrderRecords` used by `/sync/records`. An order's R2 object is deleted the
+moment it's confirmed synced — whether synced just now, or found already synced in Postgres from
+an earlier run — and left in place, unchanged, if anything about it fails, so the next call
+retries exactly the orders that still need it. Whenever an order ends up `"failed"` for a reason
+this route can identify, the staged object itself is overwritten with the original record plus a
+`_staging_error: {code, message, failed_at}` field (best-effort — a failure to write the
+annotation is only logged, never allowed to override the real result), so inspecting the object
+directly in R2 explains why it's stuck instead of just showing raw order data. No request body.
+
+### `POST`
+- [ ] No `X-Manager-Token` → `401`
+- [ ] Empty staging area → `200 { processed: [] }`
+- [ ] A staged order already existing in Postgres (found via a single batched
+      `SyncRepository.findExistingOrderIds` query, not one query per order) →
+      `{ outcome: "already_synced" }`, its R2 object deleted, and `SyncService.syncOrderRecords`
+      never called for it — retrying a known-already-synced order would just hit the unique
+      constraint and misreport as a failure
+- [ ] A genuinely new, valid order → priced, verified, aggregated, synced →
+      `{ outcome: "synced", synced_at }`, its R2 object deleted
+- [ ] An order whose `session_id` doesn't exist, or exists but is already closed
+      (`end_time` set) → `{ outcome: "failed", code: "INVALID_SESSION" }`, object left in R2 —
+      checked **before** any price resolution, so a bad session never triggers a needless catalog
+      lookup and can't silently fall through to a generic sync-level failure
+- [ ] An order referencing an unknown `product_id` → `{ outcome: "failed", code: "PRODUCT_NOT_FOUND" }`,
+      object left in R2, `SyncService` never called
+- [ ] An order referencing a known `product_id` but unknown `modifier_id` →
+      `{ outcome: "failed", code: "INVALID_MODIFIER" }`, object left in R2
+- [ ] A line item's `unit_price` disagrees with the current catalog price for that
+      `(product_id, modifier_id)` → `{ outcome: "failed", code: "PRICE_MISMATCH" }`, object left in
+      R2, `SyncService` never called — checked for every line item, not just once per distinct
+      product/modifier pair
+- [ ] `cash_tendered` not sent → defaults to `total_due` (the order's own resolved amount); for a
+      `"refund"` this is a negative value, matching `seed.ts`'s own convention for cash paid back
+      out (`cash_tendered: -amount, change_given: 0`)
+- [ ] `change_given` not sent → defaults to `0`
+- [ ] Either default applies independently — sending one but not the other only defaults the
+      missing one, the sent one is still used (and, for a sale, still validated)
+- [ ] A `"sale"` (or `transaction_type` omitted) order where (client-sent-or-defaulted)
+      `cash_tendered - change_given !== total_due` (computed from the verified line items) →
+      `{ outcome: "failed", code: "CASH_TOTAL_MISMATCH" }`, object left in R2, `SyncService`
+      never called — the mismatch is visible immediately rather than silently synced. Note the
+      defaults above make this trivially pass whenever the client sends neither field, so this
+      only fires on an actually-inconsistent client-sent value
+- [ ] A `"refund"` order → the cash-reconciliation check is **skipped unconditionally**
+      regardless of `cash_tendered`/`change_given` (sent or defaulted) — a client-sent
+      `cash_tendered` can never be negative (schema-enforced) so it could never reconcile against
+      a refund's negative `total_due` under the same formula, and this codebase has no verified
+      sign convention for a client-sent refund cash value yet (the `_staging_error`-annotation
+      note above doesn't apply here since this isn't a failure at all)
+- [ ] An order that fails at the `SyncService` level itself (closed session, missing recipe,
+      already-synced-elsewhere-but-not-yet-visible race) → `{ outcome: "failed" }` with **no**
+      `code` — matches `/sync/records`'s existing contract of not exposing a failure reason in the
+      response; the reason is still visible server-side via `sync-repository.ts`'s existing
+      `logger.warn`, and a generic explanation is still written into the blob's `_staging_error`
+- [ ] A staged object whose content isn't valid JSON, or doesn't match the staging schema →
+      `{ code: "STAGED_BLOB_CORRUPT" }`, processing continues for the remaining staged orders
+      rather than aborting the whole call
+- [ ] `ListObjectsV2Command` itself failing (bad R2 credentials, endpoint unreachable) →
+      `503 { code: "STAGING_STORAGE_UNAVAILABLE" }` for the whole call — nothing can be listed, so
+      no partial `processed` list is returned
+- [ ] Multiple staged orders are processed sequentially, not concurrently
+- [ ] Re-running immediately after a full success → the now-deleted orders no longer appear in
+      `processed` at all
+- [ ] Re-running against an order left over from a prior failure → retried fresh, isolated from
+      every other staged order in the same run
+
 ## [sync/heartbeat/route.ts](../src/app/api/sync/heartbeat/route.ts) *(new, matches `Api Contract.yaml`'s `/sync/heartbeat`)*
 
 Plain connectivity ping for the PWA to check it can actually reach the server (not just that the
@@ -585,6 +702,17 @@ DB call, no auth — deliberately just "did the request make it here."
 - [ ] `$transaction`: `ingredients` provided → `recipeIngredient.deleteMany` then `.createMany` for the recipe; `recipe.update` **not** called if `modifier_id` wasn't in the payload
 - [ ] `$transaction`: `modifier_id` provided → `recipe.update` called; `recipeIngredient.deleteMany`/`.createMany` **not** called if `ingredients` wasn't in the payload
 - [ ] Response `product_name` comes from the recipe's product (fetched once up front), not re-queried after the transaction
+
+### `resolveLineItemPrices` *(new — backs `sync/staging/process/route.ts`)*
+- [ ] `modifier_id=null` → resolved price is `base_price` alone
+- [ ] `modifier_id` present → resolved price is `base_price + price_adjustment`
+- [ ] Repeated `(product_id, modifier_id)` pairs in the input dedupe into a single `product`/
+      `sizeModifier` batched query each (`findMany({where:{...:{in:[...]}}})`), not one query per
+      item
+- [ ] Unknown `product_id` → `NotFoundException`
+- [ ] Known `product_id`, unknown non-null `modifier_id` → `BadRequestException`
+- [ ] Does **not** check that a `Recipe` exists for the pair — that stays `sync-repository.ts`'s
+      job, unchanged
 
 ## [employee-repository.ts](../src/repository/employee-repository.ts)
 
@@ -791,9 +919,24 @@ offline-queued-then-synced state to track. Deliberate deviation: both columns we
 ## [sync-repository.ts](../src/repository/sync-repository.ts) *(new)*
 
 One `order.create` per record inside its own `$transaction`, alongside the recipe-lookup/
-stock-decrement work for each line item — plain insert, no upsert. Sync is one-time: an order is
+stock-adjustment work for each line item — plain insert, no upsert. Sync is one-time: an order is
 written client-side (IndexedDB), synced once, and never edited afterward, so there's no update
 path to support here at all.
+
+Stock moves in the opposite direction for a refund vs. a sale: a sale decrements
+`inventory_item.current_stock` by each recipe ingredient's quantity (consuming stock); a refund
+increments by the exact same amounts (returning it) — the order is being reversed, not repeated.
+*(fixed — previously always decremented regardless of `transaction_type`, silently double-depleting
+stock on every refund instead of returning it.)*
+
+`adjustStock` resolves recipes/ingredients for the **whole order in two queries**, not one pair of
+queries per line item — the N+1 that existed when this looped per line item calling
+`recipe.findMany`/`recipeIngredient.findMany` individually. One `recipe.findMany` fetches every
+line item's recipe via an `OR` of `(product_id, modifier_id)` pairs; one `recipeIngredient.findMany`
+then fetches every ingredient for every recipe found via `recipe_id: { in: [...] }`. Consumption is
+summed per `item_id` across all line items first (`Map<item_id, Decimal>`), so an ingredient shared
+by multiple line items — or the same product ordered more than once — gets exactly one
+`inventoryItem.update`, not one per line item that touches it. *(fixed — N+1 query problem.)*
 
 `syncOne`'s `catch` only converts a fixed set of **expected** data conflicts into a per-record
 `"failed"` result — everything else rethrows, so a DB outage/Prisma misconfig surfaces as a `500`
@@ -810,17 +953,49 @@ instead of silently reporting every record as failed with no trace of why. The e
 ### `syncOrderRecords`
 - [ ] Batch is processed via a bounded worker pool (`MAX_CONCURRENT_SYNCS = 5`), not unbounded `Promise.all` — confirm no more than 5 `syncOne` calls are in flight at once for a large batch
 - [ ] Results array is length N, **same order as the input**, regardless of which record's DB call actually resolves first
-- [ ] Valid record → `shiftSession.findUnique` confirms the session is open, then `order.create` is called with `line_items: { create: [...] }` nested, then stock is decremented per recipe ingredient — all inside one `$transaction`
+- [ ] Valid record, `transaction_type` `"sale"`/omitted → `shiftSession.findUnique` confirms the session is open, then `order.create` is called with `line_items: { create: [...] }` nested, then stock is **decremented** per recipe ingredient (`quantity × line.quantity`) — all inside one `$transaction`
+- [ ] Valid record, `transaction_type: "refund"` → same flow, but stock is **incremented** by the exact same `quantity × line.quantity` amounts instead of decremented
 - [ ] Unknown `session_id`, or a line item's `product_id`/`modifier_id` not in the DB → FK violation, caught, that record's result is `{ sync_status: "failed", synced_at: null }` — nothing persisted (transaction rolls back)
 - [ ] `session_id` resolves to a session with `end_time` already set → `SessionClosedException` thrown **before** `order.create` is even called, same `"failed"` result
 - [ ] Re-synced `order_id` (already exists) → unique constraint violation, same `"failed"` result — confirm this does **not** update the existing row in any way
-- [ ] A line item's product/modifier has no seeded recipe → `RecipeNotFoundException`, same `"failed"` result, transaction rolls back any stock decrements already applied for earlier line items in that order
+- [ ] A line item's product/modifier has no seeded recipe → `RecipeNotFoundException`, same `"failed"` result, transaction rolls back any stock adjustments already applied for earlier line items in that order
+- [ ] An order with multiple (or repeated) line items → exactly one `recipe.findMany` call and one `recipeIngredient.findMany` call for the whole order, not one pair per line item — and an ingredient shared across line items receives exactly one summed `inventoryItem.update`, not one per line item
 - [ ] An unexpected error (not one of the four above) → rethrown, not swallowed — confirm the batch promise rejects rather than returning a `"failed"` result, and the route surfaces it as `500`
 - [ ] One record's create throws an expected error, others succeed → only that record comes back `"failed"`; the rest are `"synced"` — confirm each record is its own try/catch, not a shared transaction for the whole batch
 - [ ] Omitted optional fields (`transaction_type`, `order_type`, `status`, `cash_tendered`, `change_given`, `completed_at`) → defaulted (`"sale"`, `null`, `"completed"`, `null`, `null`, `null`) before being sent to Prisma
 - [ ] `line_items: []` on the record → nested `create: []` — no line items, no error
 - [ ] Success → returned `synced_at` is `getCurrentBusinessDateTime()` (business-local, not `new Date()` — it's written into a `timestamp without time zone` column), matching the value persisted as `sync_status: "synced"`
 - [ ] A batch of N records with a mix of outcomes → results array is length N, same order as the input, each with its own correct `order_id`
+
+### `findExistingOrderIds` *(new — backs `sync/staging/process/route.ts`)*
+- [ ] Given a list of `order_id`s, returns exactly the subset that already exist in `Order`, as a `Set`
+- [ ] None of the given ids exist → empty `Set`
+- [ ] A single `findMany({where:{order_id:{in:[...]}}}})` call regardless of how many ids are passed — not one query per id
+
+## [staging-repository.ts](../src/repository/staging-repository.ts) *(new)*
+
+All R2/S3 SDK calls for the offline-sync staging area live only here — `staging/` prefix, one
+object per order, keyed `staging/{order_id}.json`. Every method wraps its SDK call in try/catch
+and rethrows as `StagingStorageException`; no raw AWS SDK error ever leaks past this file.
+
+### `putOrder`
+- [ ] Uploads with `ContentType: application/json` to `staging/{orderId}.json`, returns that key
+- [ ] Re-staging the same `orderId` overwrites the existing object at the same key
+- [ ] SDK rejection → rethrown as `StagingStorageException`
+
+### `listStagedKeys`
+- [ ] Returns every key under the `staging/` prefix
+- [ ] Paginates past R2/S3's 1000-key-per-page limit via `ContinuationToken`/`IsTruncated` rather than only returning the first page
+- [ ] Empty bucket → `[]`
+- [ ] SDK rejection → rethrown as `StagingStorageException`
+
+### `getObject`
+- [ ] Returns the object body as a plain string via `Body.transformToString()`, not a stream
+- [ ] SDK rejection → rethrown as `StagingStorageException`
+
+### `deleteObject`
+- [ ] Issues a `DeleteObjectCommand` for the exact key given
+- [ ] SDK rejection → rethrown as `StagingStorageException`
 
 ---
 
@@ -904,6 +1079,68 @@ there's no token to sign, just a static secret to hand back on success.
 
 ## [sync-service.ts](../src/services/sync-service.ts) *(new)*
 - [ ] `syncOrderRecords` → `SyncRepository.syncOrderRecords`, a pure passthrough
+
+## [staging-service.ts](../src/services/staging-service.ts) *(new)*
+
+### `stageRecords`
+- [ ] Pure passthrough (like `sync-service.ts`'s methods) — no price/aggregation logic here at
+      all, `StagingRepository.putOrder` is called with the record exactly as received
+- [ ] `StagingStorageException` on one record → `{staged:false, code:"STAGING_STORAGE_UNAVAILABLE"}`
+      for that record only, doesn't stop the rest of the batch
+- [ ] An unmocked/unexpected error → rethrown, not swallowed as a per-record result
+
+### `processStaged`
+Owns everything `stageRecords` deliberately doesn't: session validity, price validation,
+quantity aggregation, `total_due` computation, cash reconciliation, the already-synced-in-Postgres
+check, the actual sync call, the delete-on-success/keep-on-failure policy, and annotating a
+failed blob with why it failed. Every staged order is isolated in its own try/catch — one order's
+failure never affects another's.
+- [ ] `SyncRepository.findExistingOrderIds` called once for the whole key list, not once per key
+- [ ] An id it returns → `outcome:"already_synced"`, its object deleted, `SyncService
+      .syncOrderRecords` never called for it
+- [ ] `ShiftSessionRepository.isOpenSession(session_id)` false (unknown or closed session) →
+      `INVALID_SESSION`, checked before any price resolution — `ProductRepository
+      .resolveLineItemPrices` and `SyncService.syncOrderRecords` are both **not called**
+- [ ] A genuinely new order with a valid session → current catalog price resolved via
+      `ProductRepository.resolveLineItemPrices` for every line item and compared against that
+      line item's client-sent `unit_price`; any single line item's disagreement throws
+      `PriceMismatchException` before anything is aggregated or synced
+- [ ] Price checks out on every line item → repeated `(product_id, modifier_id)` entries
+      aggregated into `quantity`, `total_due` summed from the verified catalog prices and negated
+      for `transaction_type:"refund"`
+- [ ] A line item's `unit_price` disagrees with the resolved catalog price → `PRICE_MISMATCH`,
+      `SyncService` never called, object left in R2
+- [ ] `cash_tendered`/`change_given` each independently default to `total_due`/`0` when not sent
+      by the client (rather than being stored `null`) — sending one but not the other only
+      defaults the missing one
+- [ ] `transaction_type` is `"sale"`/omitted, and (client-sent-or-defaulted) `cash_tendered` /
+      `change_given`'s difference doesn't equal the computed `total_due` → `CASH_TOTAL_MISMATCH`,
+      `SyncService` never called, object left in R2 — the defaults above make this trivially pass
+      when the client sends neither field
+- [ ] `transaction_type` is `"refund"` → reconciliation check skipped unconditionally, regardless
+      of `cash_tendered`/`change_given` values (sent or defaulted); the default (`total_due`,
+      negative) is still what gets stored, matching `seed.ts`'s convention
+- [ ] `SyncService.syncOrderRecords` result `"synced"` → object deleted; `"failed"` → object left
+      in place, `outcome:"failed"` with no `code`
+- [ ] Unparseable/schema-invalid staged blob → `STAGED_BLOB_CORRUPT`, loop continues to the next
+      key rather than aborting
+- [ ] An unmocked/unexpected error → rethrown rather than swallowed as a per-key result
+
+#### `annotateFailure` (private helper)
+- [ ] On any identifiable failure (`INVALID_SESSION`, `PRODUCT_NOT_FOUND`, `INVALID_MODIFIER`,
+      `PRICE_MISMATCH`, `CASH_TOTAL_MISMATCH`, or a plain `SyncService`-level `"failed"`), the
+      staged object is overwritten via `StagingRepository.putOrder` with the original record's
+      fields plus `_staging_error: {code, message, failed_at}` — `code` is `null` for the plain
+      `SyncService`-level case, since that failure's specific reason isn't exposed at this layer
+      (matches `/sync/records`'s contract)
+- [ ] The extra `_staging_error` field has no effect on the next `processStaged` run —
+      `StagingOrderRecordSchema.safeParse` strips unrecognized keys, so re-reading an annotated
+      blob behaves identically to reading an un-annotated one
+- [ ] If the annotation write itself fails (e.g. transient R2 error), it's logged as a warning
+      only — the real per-order failure result (`PRICE_MISMATCH`, etc.) is still returned
+      unchanged, never overridden by the annotation attempt's own failure
+- [ ] Not called for `STAGED_BLOB_CORRUPT` or `STAGING_STORAGE_UNAVAILABLE` — there's no reliably
+      parseable record to annotate in either case
 
 ---
 
@@ -1083,3 +1320,28 @@ Each schema's "operations" are its field-level validation rules. Test each rule 
 ### `SyncRecordsRequestSchema`
 - [ ] `records: []` → rejected (`.min(1)`)
 - [ ] One invalid record among several valid ones → whole payload rejected (schema-level; per-record failure only happens after this, in the repository)
+
+## [staging.ts](../src/types/staging.ts) *(new — backs the R2-staged offline sync endpoints, no `Api Contract.yaml` equivalent)*
+### `StagingLineItemSchema` (nested)
+- [ ] `product_id` non-integer → rejected
+- [ ] `unit_price` missing → rejected (unlike `/sync/records`, this is required — the client always
+      sends its own computed price here, for `sync/staging/process/route.ts` to cross-check)
+- [ ] `unit_price` negative → rejected
+- [ ] `modifier_id` omitted/`null` → accepted (reseller line items have no size)
+### `StagingOrderRecordSchema`
+- [ ] `order_id`/`session_id` missing or empty → rejected
+- [ ] `created_at` missing → rejected
+- [ ] `total_due` is **not** a field here at all — computed server-side in `processStaged`, never
+      accepted from the client (unlike `/sync/records`)
+- [ ] `status="completed"` without `completed_at` → rejected (cross-field `.refine`, same rule as
+      `OrderSyncRecordSchema`)
+- [ ] `transaction_type` `"sale"`/omitted with `order_type` missing/`null`/invalid → rejected
+      (cross-field `.refine` — a sale must be `"dine_in"` or `"take_out"`)
+- [ ] `transaction_type: "refund"` with `order_type` set to `"dine_in"`/`"take_out"` → rejected —
+      a refund is neither
+- [ ] `transaction_type: "refund"` with `order_type` omitted/`null` → accepted
+- [ ] `line_items: []` → rejected (`.min(1)` — unlike `OrderSyncRecordSchema`, an empty basket
+      isn't staged since staging only happens for a resolved order)
+- [ ] Fully valid payload → accepted
+### `StagingRequestSchema`
+- [ ] `records: []` → rejected (`.min(1)`)
