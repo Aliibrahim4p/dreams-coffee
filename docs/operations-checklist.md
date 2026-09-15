@@ -647,6 +647,13 @@ DB call, no auth — deliberately just "did the request make it here."
 
 ## [shift-session-repository.ts](../src/repository/shift-session-repository.ts) *(new)*
 
+`Api Contract.yaml`'s `ShiftSession` schema defines `sync_status`/`synced_at`, but neither field
+was ever read or written anywhere in this codebase — a shift session is only ever created live
+(gated by `X-Panel-Token`, which itself requires connectivity to obtain), so there's no genuine
+offline-queued-then-synced state for it to track, unlike `Order`. Deliberate deviation: both
+columns were dropped from `shift_session` entirely rather than kept as permanently-unused dead
+weight.
+
 ### `openSession`
 - [ ] `cashier_pos_id` doesn't match any employee → `NotFoundException`
 - [ ] `cashier_pos_id` matches a **deactivated** employee → same `NotFoundException`
@@ -712,6 +719,12 @@ DB call, no auth — deliberately just "did the request make it here."
 
 ## [delivery-repository.ts](../src/repository/delivery-repository.ts)
 
+`Api Contract.yaml`'s `DeliveryDetail` schema defines `sync_status`/`synced_at`, but
+`createDelivery` always set `sync_status: "synced"` unconditionally at write time — a delivery is
+only ever created live (same `X-Manager-Token` connectivity requirement as everything else on the
+Admin-PC surface), so the value never varied. Deliberate deviation: both columns were dropped from
+`delivery` entirely rather than kept as a hardcoded constant nobody reads.
+
 ### `createDelivery`
 - [ ] Invalid `supplier_id` → `BadRequestException`
 - [ ] Invalid `manager_id` → `BadRequestException` via `ManagerRepository.findManager` (not the raw `prisma.manager` call directly anymore — same lookup `inventory-count-entry-repository.ts` now shares) *(not reachable via the real API — `managerId` always comes pre-verified from the proxy; only testable by calling the repository directly, e.g. in a unit test)*
@@ -731,6 +744,13 @@ DB call, no auth — deliberately just "did the request make it here."
 - [ ] Found → full nested shape verified field-by-field against the DB row
 
 ## [inventory-count-entry-repository.ts](../src/repository/inventory-count-entry-repository.ts)
+
+`Api Contract.yaml`'s `InventoryCountEntry` schema defines `sync_status`/`synced_at`, but neither
+field was ever set here — `createEntry` never wrote them (leaving `sync_status` permanently at its
+schema default of `"pending"`) and `updateEntry` never touched them either. A count entry is only
+ever submitted live (same connectivity requirement as deliveries), so there's no genuine
+offline-queued-then-synced state to track. Deliberate deviation: both columns were dropped from
+`inventory_count_entry` entirely rather than kept as permanently-`"pending"` dead weight.
 
 ### `createEntry`
 - [ ] Invalid `item_id` → `BadRequestException`
