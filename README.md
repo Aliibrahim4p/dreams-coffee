@@ -35,7 +35,8 @@ incrementally, and deliberate deviations are called out in code comments and in
   entries with a same-day edit lock
 - **Config**: LBP/USD exchange rate
 - **Offline sync**: connectivity heartbeat, batch order sync from the PWA's local
-  IndexedDB store
+  IndexedDB store, and an R2-backed staging layer (`/sync/staging`, `/sync/staging/process`)
+  that durably saves each order before syncing it, so a failed sync never loses data
 
 ## Order building lives on the frontend
 
@@ -84,6 +85,8 @@ pushes finished orders to `POST /api/sync/records` once connectivity allows — 
    - `MANAGER_JWT_SECRET`, `ADMIN_JWT_SECRET`, `SESSION_JWT_SECRET` — HMAC signing secrets
    - `ADMIN_SECRET_KEY` — shared admin login secret
    - `PANEL_SECRET_KEY` — shared Manager Panel token (handed back verbatim on correct PIN)
+   - `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` — Cloudflare R2
+     credentials backing the offline-sync staging area (see `POST /api/sync/staging`)
 2. Install dependencies and apply migrations:
    ```bash
    npm install

@@ -2089,6 +2089,229 @@ paths:
           description: Malformed request — schema validation failed for the whole batch
         "401":
           $ref: "#/components/responses/ManagerRequired"
+  /sync/staging:
+    post:
+      tags:
+        - Sync
+      summary: Durably stage orders in R2 ahead of sync
+      description: |
+        A durable landing zone in front of /sync/records, backed by Cloudflare R2: every
+        order is written to its own object (staging/{order_id}.json) before anything is
+        attempted against Postgres, so a failed sync leaves the order recoverable instead
+        of lost.
+
+        Deliberately does no business validation — only request shape is checked here.
+        Unlike /sync/records, line items are flat: one entry per unit (product_id +
+        modifier_id), no quantity and no total_due from the client. unit_price is still
+        sent so /sync/staging/process can both use it and cross-check it against the
+        current catalog price, not so the terminal can skip sending it. order_type is not
+        required to be present here even though it will be required later, since a
+        client-side omission shouldn't block a durable save — see
+        /sync/staging/process below.
+
+        Price resolution, quantity aggregation, cash reconciliation, and the actual sync
+        all happen later, in /sync/staging/process. This endpoint can only fail on a
+        genuine storage outage, never on the data itself.
+      security:
+        - managerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - records
+              properties:
+                records:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - order_id
+                      - session_id
+                      - created_at
+                      - line_items
+                    properties:
+                      order_id:
+                        type: string
+                        description: Client-generated (offline); also the R2 object key
+                      session_id:
+                        type: string
+                        format: uuid
+                      transaction_type:
+                        type: string
+                        enum:
+                          - sale
+                          - refund
+                        default: sale
+                      order_type:
+                        type: string
+                        enum:
+                          - dine_in
+                          - take_out
+                        nullable: true
+                        description: Not enforced here — required/forbidden check happens at process time
+                      status:
+                        type: string
+                        enum:
+                          - open
+                          - completed
+                        default: completed
+                      cash_tendered:
+                        type: number
+                        format: decimal
+                        nullable: true
+                        description: Defaults to total_due at process time when omitted
+                      change_given:
+                        type: number
+                        format: decimal
+                        nullable: true
+                        description: Defaults to 0 at process time when omitted
+                      created_at:
+                        type: string
+                        format: date-time
+                      completed_at:
+                        type: string
+                        format: date-time
+                        nullable: true
+                        description: Required when status is completed
+                      line_items:
+                        type: array
+                        minItems: 1
+                        description: One entry per unit — no quantity, no total_due; both are computed at process time
+                        items:
+                          type: object
+                          required:
+                            - product_id
+                            - unit_price
+                          properties:
+                            product_id:
+                              type: integer
+                            modifier_id:
+                              type: integer
+                              nullable: true
+                            unit_price:
+                              type: number
+                              format: decimal
+                              minimum: 0
+                              description: Client-computed offline; cross-checked against the current catalog price at process time
+      responses:
+        "200":
+          description: Per-record results — staged or, only on a storage outage, not staged. Always 200; failures are per-record, not a batch-level error.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        order_id:
+                          type: string
+                        staged:
+                          type: boolean
+                        key:
+                          type: string
+                          description: R2 object key; present only when staged is true
+                        code:
+                          type: string
+                          enum:
+                            - STAGING_STORAGE_UNAVAILABLE
+                          description: Present only when staged is false
+                        message:
+                          type: string
+                          description: Present only when staged is false
+        "400":
+          description: Malformed request — schema validation failed for the whole batch
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+  /sync/staging/process:
+    post:
+      tags:
+        - Sync
+      summary: Sync every currently-staged order
+      description: |
+        Scans everything currently staged in R2 and, for each order not already in
+        Postgres, confirms its session_id references a currently open shift session,
+        resolves and cross-checks every line item's current catalog price, checks
+        order_type is present for a sale and absent for a refund, aggregates repeated
+        (product_id, modifier_id) entries into quantity, computes total_due from the
+        verified prices, reconciles cash for sales (cash_tendered - change_given must
+        equal total_due; skipped for refunds), and only then syncs through the same path
+        as /sync/records.
+
+        An order's R2 object is deleted the moment it's confirmed synced — whether synced
+        just now, or found already synced from an earlier run — and left in place,
+        annotated with the failure reason, if anything about it fails, so the next call
+        retries exactly the orders that still need attention. No request body.
+      security:
+        - managerToken: []
+      responses:
+        "200":
+          description: Per-order results. Always 200 unless the staging area itself can't be listed; failures are per-order.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  processed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                          description: R2 object key
+                        order_id:
+                          type: string
+                          nullable: true
+                          description: Null only when a corrupt blob's own order_id can't be determined
+                        outcome:
+                          type: string
+                          enum:
+                            - synced
+                            - already_synced
+                            - failed
+                          description: Absent for STAGED_BLOB_CORRUPT/STAGING_STORAGE_UNAVAILABLE, which aren't a sync outcome at all
+                        synced_at:
+                          type: string
+                          format: date-time
+                          nullable: true
+                          description: Present only when outcome is synced or already_synced
+                        code:
+                          type: string
+                          enum:
+                            - INVALID_SESSION
+                            - INVALID_ORDER_TYPE
+                            - PRODUCT_NOT_FOUND
+                            - INVALID_MODIFIER
+                            - PRICE_MISMATCH
+                            - CASH_TOTAL_MISMATCH
+                            - STAGED_BLOB_CORRUPT
+                            - STAGING_STORAGE_UNAVAILABLE
+                          description: Present on a failed/corrupt/unavailable result; absent on a plain sync-level failure (no reason exposed, same as /sync/records) or a success
+                        message:
+                          type: string
+                          description: Present alongside most codes
+        "401":
+          $ref: "#/components/responses/ManagerRequired"
+        "503":
+          description: The staging area itself couldn't be listed (bad R2 credentials, endpoint unreachable) — nothing could be processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - STAGING_STORAGE_UNAVAILABLE
+                  message:
+                    type: string
   /suppliers/{supplier_id}:
     patch:
       tags:

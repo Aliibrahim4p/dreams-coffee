@@ -2,10 +2,10 @@ jest.mock("@/lib/db", () => ({
   __esModule: true,
   default: {
     category: { findUnique: jest.fn() },
-    product: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn() },
+    product: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn(), findMany: jest.fn() },
     recipe: { findMany: jest.fn(), create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), findUniqueOrThrow: jest.fn() },
     recipeIngredient: { deleteMany: jest.fn(), createMany: jest.fn() },
-    sizeModifier: { findUnique: jest.fn() },
+    sizeModifier: { findUnique: jest.fn(), findMany: jest.fn() },
     inventoryItem: { findMany: jest.fn() },
     $transaction: jest.fn(),
   },
@@ -20,10 +20,10 @@ import { ProductRepository, resolveProductSizes } from "@/repository/product-rep
 
 const db = prisma as unknown as {
   category: { findUnique: jest.Mock };
-  product: { create: jest.Mock; update: jest.Mock; findUnique: jest.Mock };
+  product: { create: jest.Mock; update: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock };
   recipe: { findMany: jest.Mock; create: jest.Mock; findUnique: jest.Mock; update: jest.Mock; findUniqueOrThrow: jest.Mock };
   recipeIngredient: { deleteMany: jest.Mock; createMany: jest.Mock };
-  sizeModifier: { findUnique: jest.Mock };
+  sizeModifier: { findUnique: jest.Mock; findMany: jest.Mock };
   inventoryItem: { findMany: jest.Mock };
   $transaction: jest.Mock;
 };
@@ -443,5 +443,67 @@ describe("ProductRepository.updateRecipe", () => {
     expect(db.recipeIngredient.deleteMany).not.toHaveBeenCalled();
     expect(db.recipeIngredient.createMany).not.toHaveBeenCalled();
     expect(result.modifier_id).toBe(2);
+  });
+});
+
+describe("ProductRepository.resolveLineItemPrices", () => {
+  const repo = new ProductRepository();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("resolves base_price alone when modifier_id is null", async () => {
+    db.product.findMany.mockResolvedValue([{ product_id: 1, base_price: 100000 as unknown as Prisma.Decimal }]);
+    db.sizeModifier.findMany.mockResolvedValue([]);
+
+    const prices = await repo.resolveLineItemPrices([{ product_id: 1, modifier_id: null }]);
+
+    expect(prices.get("1:null")).toBe(100000);
+    expect(db.sizeModifier.findMany).not.toHaveBeenCalled();
+  });
+
+  it("resolves base_price + price_adjustment when modifier_id is present", async () => {
+    db.product.findMany.mockResolvedValue([{ product_id: 1, base_price: 100000 as unknown as Prisma.Decimal }]);
+    db.sizeModifier.findMany.mockResolvedValue([
+      { modifier_id: 2, price_adjustment: 20000 as unknown as Prisma.Decimal },
+    ]);
+
+    const prices = await repo.resolveLineItemPrices([{ product_id: 1, modifier_id: 2 }]);
+
+    expect(prices.get("1:2")).toBe(120000);
+  });
+
+  it("dedupes repeated (product_id, modifier_id) pairs into a single batched query", async () => {
+    db.product.findMany.mockResolvedValue([{ product_id: 1, base_price: 100000 as unknown as Prisma.Decimal }]);
+    db.sizeModifier.findMany.mockResolvedValue([]);
+
+    const prices = await repo.resolveLineItemPrices([
+      { product_id: 1, modifier_id: null },
+      { product_id: 1, modifier_id: null },
+      { product_id: 1, modifier_id: null },
+    ]);
+
+    expect(db.product.findMany).toHaveBeenCalledTimes(1);
+    expect(db.product.findMany).toHaveBeenCalledWith({ where: { product_id: { in: [1] } } });
+    expect(prices.size).toBe(1);
+  });
+
+  it("throws NotFoundException for an unknown product_id", async () => {
+    db.product.findMany.mockResolvedValue([]);
+    db.sizeModifier.findMany.mockResolvedValue([]);
+
+    await expect(repo.resolveLineItemPrices([{ product_id: 999, modifier_id: null }])).rejects.toThrow(
+      NotFoundException,
+    );
+  });
+
+  it("throws BadRequestException for an unknown modifier_id", async () => {
+    db.product.findMany.mockResolvedValue([{ product_id: 1, base_price: 100000 as unknown as Prisma.Decimal }]);
+    db.sizeModifier.findMany.mockResolvedValue([]);
+
+    await expect(repo.resolveLineItemPrices([{ product_id: 1, modifier_id: 999 }])).rejects.toThrow(
+      BadRequestException,
+    );
   });
 });

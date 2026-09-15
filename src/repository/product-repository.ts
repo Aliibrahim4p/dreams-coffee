@@ -170,6 +170,47 @@ export class ProductRepository {
     return resolveProductSizes(product, recipes);
   }
 
+  async resolveLineItemPrices(
+    items: { product_id: number; modifier_id: number | null }[],
+  ): Promise<Map<string, number>> {
+    const productIds = [...new Set(items.map((item) => item.product_id))];
+    const modifierIds = [
+      ...new Set(items.map((item) => item.modifier_id).filter((id): id is number => id !== null)),
+    ];
+
+    const [products, modifiers] = await Promise.all([
+      prisma.product.findMany({ where: { product_id: { in: productIds } } }),
+      modifierIds.length
+        ? prisma.sizeModifier.findMany({ where: { modifier_id: { in: modifierIds } } })
+        : Promise.resolve([]),
+    ]);
+    const productMap = new Map(products.map((product) => [product.product_id, product]));
+    const modifierMap = new Map(modifiers.map((modifier) => [modifier.modifier_id, modifier]));
+
+    const prices = new Map<string, number>();
+    for (const { product_id, modifier_id } of items) {
+      const key = `${product_id}:${modifier_id ?? "null"}`;
+      if (prices.has(key)) continue;
+
+      const product = productMap.get(product_id);
+      if (!product) {
+        throw new NotFoundException(`Product ${product_id} not found`);
+      }
+
+      let priceAdjustment = 0;
+      if (modifier_id !== null) {
+        const modifier = modifierMap.get(modifier_id);
+        if (!modifier) {
+          throw new BadRequestException(`Invalid modifier_id ${modifier_id}`);
+        }
+        priceAdjustment = Number(modifier.price_adjustment);
+      }
+
+      prices.set(key, Number(product.base_price) + priceAdjustment);
+    }
+    return prices;
+  }
+
   async getProductRecipe(productId: number, modifierId?: number) {
     const product = await prisma.product.findUnique({ where: { product_id: productId } });
     if (!product) {

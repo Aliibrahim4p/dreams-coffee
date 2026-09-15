@@ -3,3 +3,7 @@ process.env.ADMIN_SECRET_KEY ??= "test-admin-secret-key";
 process.env.ADMIN_JWT_SECRET ??= "test-admin-jwt-secret";
 process.env.PANEL_SECRET_KEY ??= "test-panel-secret-key";
 process.env.SESSION_JWT_SECRET ??= "test-session-jwt-secret";
+process.env.R2_ENDPOINT ??= "https://test-account.r2.cloudflarestorage.com";
+process.env.R2_BUCKET ??= "test-staging-bucket";
+process.env.R2_ACCESS_KEY_ID ??= "test-r2-access-key";
+process.env.R2_SECRET_ACCESS_KEY ??= "test-r2-secret-key";
