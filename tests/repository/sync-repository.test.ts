@@ -10,12 +10,16 @@ jest.mock("@/lib/db", () => ({
   __esModule: true,
   default: {
     $transaction: jest.fn((callback: (tx: unknown) => unknown) => callback(mockTx)),
+    order: { findMany: jest.fn() },
   },
 }));
 
+import prisma from "@/lib/db";
 import { SyncRepository } from "@/repository/sync-repository";
 import { OrderSyncRecord } from "@/types/sync";
 import { Prisma } from "@/app/generated/prisma/client";
+
+const db = prisma as unknown as { order: { findMany: jest.Mock } };
 
 function uniqueError(target: string[]) {
   return new Prisma.PrismaClientKnownRequestError("unique violation", {
@@ -52,7 +56,7 @@ describe("SyncRepository.syncOrderRecords", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockTx.order.create.mockResolvedValue({});
-    mockTx.recipe.findMany.mockResolvedValue([{ recipe_id: 1 }]);
+    mockTx.recipe.findMany.mockResolvedValue([{ recipe_id: 1, product_id: 1, modifier_id: 2 }]);
     mockTx.recipeIngredient.findMany.mockResolvedValue([]);
     mockTx.inventoryItem.update.mockResolvedValue({});
     mockTx.shiftSession.findUnique.mockResolvedValue({ end_time: null });
@@ -121,17 +125,57 @@ describe("SyncRepository.syncOrderRecords", () => {
   });
 
   it("decrements stock for every recipe ingredient consumed by each line item", async () => {
-    mockTx.recipe.findMany.mockResolvedValueOnce([{ recipe_id: 7 }]);
+    mockTx.recipe.findMany.mockResolvedValueOnce([{ recipe_id: 7, product_id: 1, modifier_id: 2 }]);
     mockTx.recipeIngredient.findMany.mockResolvedValueOnce([
-      { item_id: 10, quantity: { times: (n: number) => `18*${n}` } },
+      { recipe_id: 7, item_id: 10, quantity: { times: (n: number) => new Prisma.Decimal(18).times(n) } },
     ]);
 
     await repo.syncOrderRecords([baseRecord]);
 
-    expect(mockTx.inventoryItem.update).toHaveBeenCalledWith({
-      where: { item_id: 10 },
-      data: { current_stock: { decrement: "18*2" } },
-    });
+    const call = mockTx.inventoryItem.update.mock.calls[0][0];
+    expect(call.where).toEqual({ item_id: 10 });
+    expect(call.data.current_stock.decrement.toString()).toBe("36");
+  });
+
+  it("increments stock instead of decrementing when the order is a refund", async () => {
+    mockTx.recipe.findMany.mockResolvedValueOnce([{ recipe_id: 7, product_id: 1, modifier_id: 2 }]);
+    mockTx.recipeIngredient.findMany.mockResolvedValueOnce([
+      { recipe_id: 7, item_id: 10, quantity: { times: (n: number) => new Prisma.Decimal(18).times(n) } },
+    ]);
+
+    await repo.syncOrderRecords([{ ...baseRecord, transaction_type: "refund" }]);
+
+    const call = mockTx.inventoryItem.update.mock.calls[0][0];
+    expect(call.where).toEqual({ item_id: 10 });
+    expect(call.data.current_stock.increment.toString()).toBe("36");
+  });
+
+  it("resolves every line item's recipe in a single findMany call, regardless of line item count", async () => {
+    const twoLineRecord: OrderSyncRecord = {
+      ...baseRecord,
+      line_items: [
+        { product_id: 1, modifier_id: 2, quantity: 2, unit_price: 2500 },
+        { product_id: 3, modifier_id: null, quantity: 1, unit_price: 1500 },
+      ],
+    };
+    mockTx.recipe.findMany.mockResolvedValueOnce([
+      { recipe_id: 7, product_id: 1, modifier_id: 2 },
+      { recipe_id: 8, product_id: 3, modifier_id: null },
+    ]);
+    mockTx.recipeIngredient.findMany.mockResolvedValueOnce([
+      { recipe_id: 7, item_id: 10, quantity: { times: (n: number) => new Prisma.Decimal(n) } },
+      { recipe_id: 8, item_id: 10, quantity: { times: (n: number) => new Prisma.Decimal(n) } },
+    ]);
+
+    await repo.syncOrderRecords([twoLineRecord]);
+
+    expect(mockTx.recipe.findMany).toHaveBeenCalledTimes(1);
+    expect(mockTx.recipeIngredient.findMany).toHaveBeenCalledTimes(1);
+    // both line items consume item_id 10 — one summed update (2 + 1 = 3), not two separate ones
+    expect(mockTx.inventoryItem.update).toHaveBeenCalledTimes(1);
+    const call = mockTx.inventoryItem.update.mock.calls[0][0];
+    expect(call.where).toEqual({ item_id: 10 });
+    expect(call.data.current_stock.decrement.toString()).toBe("3");
   });
 
   it("processes each record in the batch independently — one failure doesn't affect the others", async () => {
@@ -196,5 +240,33 @@ describe("SyncRepository.syncOrderRecords", () => {
     expect(mockTx.order.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ line_items: { create: [] } }),
     });
+  });
+});
+
+describe("SyncRepository.findExistingOrderIds", () => {
+  const repo = new SyncRepository();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("returns the subset of given order_ids that already exist", async () => {
+    db.order.findMany.mockResolvedValue([{ order_id: "order-1" }, { order_id: "order-3" }]);
+
+    const result = await repo.findExistingOrderIds(["order-1", "order-2", "order-3"]);
+
+    expect(result).toEqual(new Set(["order-1", "order-3"]));
+    expect(db.order.findMany).toHaveBeenCalledWith({
+      where: { order_id: { in: ["order-1", "order-2", "order-3"] } },
+      select: { order_id: true },
+    });
+  });
+
+  it("returns an empty set when none of the given order_ids exist", async () => {
+    db.order.findMany.mockResolvedValue([]);
+
+    const result = await repo.findExistingOrderIds(["order-1"]);
+
+    expect(result).toEqual(new Set());
   });
 });
