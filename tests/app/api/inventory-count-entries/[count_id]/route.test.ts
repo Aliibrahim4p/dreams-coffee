@@ -24,8 +24,6 @@ describe("GET /api/inventory-count-entries/[count_id]", () => {
       variance: -90,
       entry_date: new Date(),
       is_locked: false,
-      sync_status: "pending",
-      synced_at: null,
     });
 
     const req = new NextRequest("http://localhost/api/inventory-count-entries/1");

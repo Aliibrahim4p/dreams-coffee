@@ -332,8 +332,6 @@ async function main() {
       supplier_id: activeSupplier.supplier_id,
       date_received: today,
       notes: null,
-      sync_status: "synced",
-      synced_at: today,
       line_items: {
         create: [
           {
@@ -358,8 +356,6 @@ async function main() {
       supplier_id: metroDairySupplier.supplier_id,
       date_received: yesterday,
       notes: "2 bags damaged in transit",
-      sync_status: "pending",
-      synced_at: null,
       line_items: {
         create: [
           {
@@ -378,8 +374,6 @@ async function main() {
       supplier_id: inactiveSupplier.supplier_id,
       date_received: yesterday,
       notes: "Retry sync failed",
-      sync_status: "failed",
-      synced_at: null,
       line_items: {
         create: [
           {
@@ -407,8 +401,6 @@ async function main() {
       physical_count: 4800,
       entry_date: today,
       is_locked: false,
-      sync_status: "pending",
-      synced_at: null,
     },
   });
   await prisma.inventoryCountEntry.create({
@@ -418,8 +410,6 @@ async function main() {
       physical_count: 11500,
       entry_date: yesterday,
       is_locked: true,
-      sync_status: "synced",
-      synced_at: yesterday,
     },
   });
   await prisma.inventoryCountEntry.create({
@@ -429,8 +419,6 @@ async function main() {
       physical_count: 49000,
       entry_date: today,
       is_locked: false,
-      sync_status: "failed",
-      synced_at: null,
     },
   });
 
@@ -443,8 +431,6 @@ async function main() {
       start_time: yesterday,
       end_time: new Date("2026-07-27T18:00:00Z"),
       live_cash_total: 654000,
-      sync_status: "synced",
-      synced_at: new Date("2026-07-27T18:05:00Z"),
     },
   });
 
@@ -558,8 +544,6 @@ async function main() {
       start_time: today,
       end_time: null,
       live_cash_total: 500000,
-      sync_status: "pending",
-      synced_at: null,
     },
   });
 

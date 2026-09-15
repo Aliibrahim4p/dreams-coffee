@@ -33,8 +33,6 @@ describe("POST /api/deliveries", () => {
       supplier_name: "Acme",
       date_received: new Date(),
       notes: null,
-      sync_status: "pending",
-      synced_at: null,
       line_items: [],
     });
 
@@ -96,8 +94,6 @@ describe("POST /api/deliveries", () => {
       supplier_name: "Acme",
       date_received: new Date(),
       notes: null,
-      sync_status: "pending",
-      synced_at: null,
       line_items: [],
     });
 

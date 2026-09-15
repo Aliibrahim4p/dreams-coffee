@@ -34,8 +34,6 @@ describe("POST /api/inventory-count-entries", () => {
       variance: -90,
       entry_date: new Date(),
       is_locked: false,
-      sync_status: "pending",
-      synced_at: null,
     });
 
     const res = await POST(makePostRequest(validBody));

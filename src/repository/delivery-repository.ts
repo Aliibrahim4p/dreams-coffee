@@ -2,10 +2,7 @@ import prisma from "@/lib/db";
 import { PackType, Prisma } from "@/app/generated/prisma/client";
 import BadRequestException from "@/exceptions/bad-request-exception";
 import NotFoundException from "@/exceptions/not-found-exception";
-import {
-  getCurrentBusinessDate,
-  getCurrentBusinessDateTime,
-} from "@/lib/business-date";
+import { getCurrentBusinessDate } from "@/lib/business-date";
 import { ManagerRepository } from "@/repository/manager-repository";
 import { DeliveryCreate } from "@/types/delivery";
 import logger from "@/util/logger";
@@ -16,8 +13,6 @@ type DeliveryWithRelations = {
   supplier_id: number;
   date_received: Date;
   notes: string | null;
-  sync_status: string;
-  synced_at: Date | null;
   supplier: { name: string };
   line_items: Array<{
     item_id: number;
@@ -37,8 +32,6 @@ function mapDelivery(delivery: DeliveryWithRelations) {
     supplier_name: delivery.supplier.name,
     date_received: delivery.date_received,
     notes: delivery.notes,
-    sync_status: delivery.sync_status,
-    synced_at: delivery.synced_at,
     line_items: delivery.line_items.map((line) => ({
       item_id: line.item_id,
       item_name: line.item.name,
@@ -97,8 +90,6 @@ export class DeliveryRepository {
             supplier_id: data.supplier_id,
             date_received: getCurrentBusinessDate(),
             notes: data.notes ?? null,
-            sync_status: "synced",
-            synced_at: getCurrentBusinessDateTime(),
             line_items: {
               create: data.line_items.map((line) => ({
                 item_id: line.item_id,
