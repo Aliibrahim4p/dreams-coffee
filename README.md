@@ -35,7 +35,8 @@ incrementally, and deliberate deviations are called out in code comments and in
   entries with a same-day edit lock
 - **Config**: LBP/USD exchange rate
 - **Offline sync**: connectivity heartbeat, batch order sync from the PWA's local
-  IndexedDB store
+  IndexedDB store, and an R2-backed staging layer (`/sync/staging`, `/sync/staging/process`)
+  that durably saves each order before syncing it, so a failed sync never loses data
 
 ## Order building lives on the frontend
 

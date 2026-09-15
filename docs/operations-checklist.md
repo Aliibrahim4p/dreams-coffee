@@ -471,7 +471,7 @@ connection to its own endpoint.
 - [ ] Response shape is `{ results: [{ order_id, sync_status, synced_at }] }` and nothing else per the spec — no extra fields, no error messages
 - [ ] Confirm `synced_at` in a `"synced"` result is a real timestamp (not the client's `created_at`/`completed_at`)
 
-## [sync/staging/route.ts](../src/app/api/sync/staging/route.ts) *(new — R2-staged offline sync)*
+## [sync/staging/route.ts](../src/app/api/sync/staging/route.ts) *(new, matches `Api Contract.yaml`'s `/sync/staging`)*
 
 A durable landing zone in front of `/sync/records`, backed by Cloudflare R2: every order is
 written to its own R2 object (`staging/{order_id}.json`) before anything is attempted against
@@ -507,7 +507,7 @@ on the data itself.
       `{ staged: false, code: "STAGING_STORAGE_UNAVAILABLE", message }`, other orders in the same
       batch unaffected
 
-## [sync/staging/process/route.ts](../src/app/api/sync/staging/process/route.ts) *(new — R2-staged offline sync)*
+## [sync/staging/process/route.ts](../src/app/api/sync/staging/process/route.ts) *(new, matches `Api Contract.yaml`'s `/sync/staging/process`)*
 
 Where all the real work happens: scans everything currently under R2's `staging/` prefix and, for
 each staged order not already in Postgres, checks that its `session_id` references a currently
@@ -1321,7 +1321,7 @@ Each schema's "operations" are its field-level validation rules. Test each rule 
 - [ ] `records: []` → rejected (`.min(1)`)
 - [ ] One invalid record among several valid ones → whole payload rejected (schema-level; per-record failure only happens after this, in the repository)
 
-## [staging.ts](../src/types/staging.ts) *(new — backs the R2-staged offline sync endpoints, no `Api Contract.yaml` equivalent)*
+## [staging.ts](../src/types/staging.ts) *(new — backs the R2-staged offline sync endpoints; matches `Api Contract.yaml`'s `/sync/staging` and `/sync/staging/process`)*
 ### `StagingLineItemSchema` (nested)
 - [ ] `product_id` non-integer → rejected
 - [ ] `unit_price` missing → rejected (unlike `/sync/records`, this is required — the client always
